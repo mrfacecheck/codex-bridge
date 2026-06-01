@@ -1,0 +1,57 @@
+{
+  "name": "codex-bridge",
+  "version": "2.1.0",
+  "description": "MCP evidence layer bridging Claude Code and OpenAI Codex — run-scoped git diff, sensitive content protection, multi-turn session management",
+  "type": "module",
+  "bin": {
+    "codex-bridge": "./bin/codex-bridge.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "codex",
+    "openai",
+    "anthropic",
+    "ai-collaboration",
+    "code-review",
+    "git-diff",
+    "evidence-layer"
+  ],
+  "author": "ycc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ycc-im/codex-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ycc-im/codex-bridge/issues"
+  },
+  "homepage": "https://github.com/ycc-im/codex-bridge#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.25.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
