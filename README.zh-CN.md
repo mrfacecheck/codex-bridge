@@ -1,6 +1,6 @@
-[English](./README.md)
-
 # codex-bridge
+
+[English](./README.md) · **中文文档**
 
 Claude 与 Codex 之间的协作证据层。
 

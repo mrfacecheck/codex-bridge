@@ -1,6 +1,6 @@
-[中文](./README.zh-CN.md)
-
 # codex-bridge
+
+**English** · [中文文档](./README.zh-CN.md)
 
 Evidence layer for Claude + Codex collaboration.
 
