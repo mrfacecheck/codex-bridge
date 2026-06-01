@@ -31,7 +31,7 @@ codex-bridge addresses each of these.
 ## Quick start
 
 ```bash
-npm install -g codex-bridge
+npm install -g @codex-bridge/core
 claude mcp add codex-bridge -- npx codex-bridge
 ```
 

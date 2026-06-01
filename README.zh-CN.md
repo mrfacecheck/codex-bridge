@@ -31,7 +31,7 @@ codex-bridge 逐一解决这五个问题。
 ## 快速开始
 
 ```bash
-npm install -g codex-bridge
+npm install -g @codex-bridge/core
 claude mcp add codex-bridge -- npx codex-bridge
 ```
 
