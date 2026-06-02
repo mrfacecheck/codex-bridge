@@ -124,6 +124,11 @@ async function main() {
       w.push("Token usage may be incomplete: Codex did not emit final turn.completed before termination.");
     }
 
+    // JSONL overflow warning
+    if (result.jsonlOverflowCount > 0) {
+      w.push(`Codex emitted ${result.jsonlOverflowCount} overlong JSONL line(s) exceeding 2MB; content omitted from parsed output.`);
+    }
+
     // Failure classification using stable Node.js error codes
     const NETWORK_MARKERS = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENETUNREACH", "ENOTFOUND", "fetch failed", "socket hang up", "network", "EPROTO"];
     let failureHint: string | undefined;
@@ -216,7 +221,7 @@ function buildCodexArgs(runCwd: string, sandbox: string, model: string | undefin
 interface WorkerCodexResult {
   sessionId: string; status: RunStatus; exitCode: number | null; signal: NodeJS.Signals | null;
   output: string; outputTruncated: boolean; stderr: string; stderrTruncated: boolean;
-  tokenUsage: TokenUsage; events: EventSummary; durationMs: number;
+  tokenUsage: TokenUsage; events: EventSummary; durationMs: number; jsonlOverflowCount: number;
 }
 
 function runCodexWorker(runId: string, args: string[], cwd: string, timeout: number, stdin: string, workerRunDir: string, wl?: WriteLock): Promise<WorkerCodexResult> {
@@ -244,9 +249,12 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
 
     // No-response detection: if Codex emits zero JSONL events for 30s, likely network issue
     const NO_RESPONSE_THRESHOLD_MS = 30_000;
+    const MAX_JSONL_LINE_CHARS = 2 * 1024 * 1024;
     let noResponseTimer: ReturnType<typeof setTimeout> | undefined;
     let noResponseFired = false;
     let jsonlEventCount = 0;
+    let jsonlLineOverflow = false;
+    let jsonlOverflowCount = 0;
 
     function startNoResponseTimer() {
       noResponseTimer = setTimeout(() => {
@@ -259,11 +267,33 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
     }
     startNoResponseTimer();
 
+    // Stall detection: if no new JSONL events for 5 minutes mid-run, flag as stale
+    const STALL_THRESHOLD_MS = 5 * 60 * 1000;
+    let lastEventAt = Date.now();
+    let stallWarned = false;
+    const stallTimer = setInterval(() => {
+      if (settled || jsonlEventCount === 0) return; // skip if not started yet or already done
+      const gap = Date.now() - lastEventAt;
+      if (gap >= STALL_THRESHOLD_MS && !stallWarned) {
+        stallWarned = true;
+        updateProgress(workerRunDir, { status: "running", message: `No new events for ${Math.round(gap / 60000)}min. Codex may be stuck.`, sessionId: sid || undefined, elapsedMs: Date.now() - t0 });
+      }
+    }, 30_000);
+    stallTimer.unref();
+
+    function isImportantProgress(m: string): boolean {
+      return m.startsWith("Session started") || m.startsWith("Error") || m.startsWith("Done")
+        || m.startsWith("Running:") || m.startsWith("Editing:") || m.startsWith("Saved:")
+        || m.startsWith("Timeout") || m.startsWith("Cancellation");
+    }
+
     function onP(m: string) {
       progressSeq++;
+      lastEventAt = Date.now();
+      stallWarned = false;
       if (noResponseTimer && !noResponseFired) { clearTimeout(noResponseTimer); noResponseTimer = undefined; }
-      if (progressSeq % 3 === 0 || m.startsWith("Session started") || m.startsWith("Error") || m.startsWith("Done")) {
-        updateProgress(workerRunDir, { status: cancelReq ? "cancelling" : "running", message: sanitize(m), sessionId: sid || undefined, elapsedMs: Date.now() - t0 });
+      if (progressSeq % 3 === 0 || isImportantProgress(m)) {
+        updateProgress(workerRunDir, { status: cancelReq ? "cancelling" : "running", message: sanitize(m), sessionId: sid || undefined, elapsedMs: Date.now() - t0, lastActivityAt: new Date().toISOString() });
       }
     }
 
@@ -281,10 +311,10 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
     function wasCancelled(): boolean { return cancelReq || isCancelRequested(workerRunDir); }
 
     function fin(s: RunStatus, ec: number | null, sg: NodeJS.Signals | null) {
-      if (settled) return; settled = true; clearTimeout(tt); clearInterval(cancelTimer); clearHardKill();
+      if (settled) return; settled = true; clearTimeout(tt); clearInterval(cancelTimer); clearInterval(stallTimer); clearHardKill();
       if (noResponseTimer) clearTimeout(noResponseTimer);
       stdoutStream.end(); stderrStream.end();
-      resolve({ sessionId: sid, status: wasCancelled() ? "cancelled" : s, exitCode: ec, signal: sg, output: out.trim(), outputTruncated: outT, stderr: err.trim(), stderrTruncated: errT, tokenUsage: tu, events: ev, durationMs: Date.now() - t0 });
+      resolve({ sessionId: sid, status: wasCancelled() ? "cancelled" : s, exitCode: ec, signal: sg, output: out.trim(), outputTruncated: outT, stderr: err.trim(), stderrTruncated: errT, tokenUsage: tu, events: ev, durationMs: Date.now() - t0, jsonlOverflowCount });
     }
     function ao(t: string) { const r = appendCap(out, t, 160_000); out = r.text; if (r.truncated) outT = true; }
     function ae(t: string) { const r = appendCap(err, t, 80_000); err = r.text; if (r.truncated) errT = true; }
@@ -313,7 +343,33 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
         else if (it.type === "command_execution" || it.type === "shell_command" || it.type === "tool_call") { const cmd = it.command || it.name || it.tool || ""; if (cmd) { const cl = sanitize(Array.isArray(cmd) ? cmd.join(" ") : String(cmd)); pushCap(ev.commands, cl, 100); onP(`Running: ${cl}`); } }
       }
     }
-    function feed(t: string) { buf += t; const ls = buf.split("\n"); buf = ls.pop() || ""; for (const l of ls) { if (l.trim()) pl(l); } }
+    function omitOverflowedJsonlLine() {
+      jsonlOverflowCount++;
+      ao(`\n...[overlong JSONL line omitted; exceeded ${MAX_JSONL_LINE_CHARS} chars]...\n`);
+      buf = "";
+      jsonlLineOverflow = false;
+    }
+    function feed(t: string) {
+      const parts = t.split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const hasNewline = i < parts.length - 1;
+        if (jsonlLineOverflow) {
+          if (hasNewline) omitOverflowedJsonlLine();
+          continue;
+        }
+        if (buf.length + part.length > MAX_JSONL_LINE_CHARS) {
+          jsonlLineOverflow = true;
+          if (hasNewline) omitOverflowedJsonlLine();
+          continue;
+        }
+        buf += part;
+        if (hasNewline) {
+          if (buf.trim()) pl(buf);
+          buf = "";
+        }
+      }
+    }
 
     const tt = setTimeout(() => { timeoutReq = true; onP(`Timeout after ${timeout}s`); killTree(proc, "SIGTERM"); scheduleHardKill(); }, timeout * 1000);
 
@@ -331,7 +387,7 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
     });
     proc.stderr?.on("end", () => { const r = sed.end(); if (r) ae(r); });
     proc.on("error", (e) => { pushCap(ev.errors, e.message, 50); fin("failed", null, null); });
-    proc.on("close", (code, sig) => { if (buf.trim()) pl(buf); fin(timeoutReq ? "timeout" : code === 0 && ev.errors.length === 0 ? "completed" : "failed", code, sig); });
+	    proc.on("close", (code, sig) => { if (jsonlLineOverflow) omitOverflowedJsonlLine(); else if (buf.trim()) pl(buf); fin(timeoutReq ? "timeout" : code === 0 && ev.errors.length === 0 ? "completed" : "failed", code, sig); });
   });
 }
 

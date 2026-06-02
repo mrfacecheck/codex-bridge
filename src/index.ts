@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn, execFileSync } from "child_process";
 import { connect as tcpConnect } from "net";
-import { existsSync, statSync } from "fs";
+import { existsSync, statSync, readFileSync, watch as fsWatch } from "fs";
 import { randomUUID } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -13,7 +13,8 @@ import {
   checkWriteLockConflict, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun,
 } from "./evidence.js";
 import {
-  createRunDir, writeRunMeta, readRunMeta, readProgress, readReviewPacket, writeReviewPacket,
+  createRunDir, writeRunMeta, readRunMeta, readProgress, readProgressEventsSince,
+  readReviewPacket, writeReviewPacket,
   pollForCompletion, updateProjectPointer, getRunDir, runDirExists,
   listRuns, cleanOldRuns, requestCancel, markWorkerDeadIfNeeded,
   assertRunId, updateProgress as updateProgressFile,
@@ -25,8 +26,20 @@ const __dirname = path.dirname(__filename);
 const WORKER_EXT = path.extname(__filename); // ".ts" in dev, ".js" in compiled
 const WORKER_SCRIPT = path.join(__dirname, `worker${WORKER_EXT}`);
 
-const DEFAULT_WAIT_BUDGET = 180;
+// Read version from package.json once at startup — no more hardcoding
+const PKG_VERSION: string = (() => {
+  try { return JSON.parse(readFileSync(path.join(__dirname, "..", "package.json"), "utf8")).version; }
+  catch { return "0.0.0"; }
+})();
+
+const DEFAULT_WAIT_BUDGET = 60;
 const MAX_WAIT_BUDGET = 240;
+
+function defaultTimeoutFor(sandbox: string, mode: string): number {
+  if (sandbox === "read-only") return 300;
+  if (mode === "async") return 1200;
+  return 900;
+}
 
 // ── Network Probe ────────────────────────────────────────────────
 function tcpProbe(host: string, port: number, timeoutMs: number): Promise<{ reachable: boolean; latencyMs: number; error?: string }> {
@@ -61,7 +74,7 @@ function sessionFromRun(runId: string): Session | undefined {
   const review = readReviewPacket(runDir) as ReviewPacketLike | null;
   if (review?.resume_attached === false) return undefined;
   const sessionId = review?.session_id || progress?.sessionId;
-  const status: Session["status"] = review?.status || (progress?.status as Session["status"]) || "running";
+  const status: Session["status"] = (review?.status as Session["status"]) || (progress?.status as Session["status"]) || "running";
   return {
     latestRunId: runId, runIds: [runId], sessionId,
     name: meta.sessionName, status, cwd: meta.cwd,
@@ -235,8 +248,198 @@ function buildProjectBrief(cwd: string, gitRoot: string | null): string | null {
   return `Project context:\n${parts.join("\n")}\n---\n`;
 }
 
+// ── View Helpers ────────────────────────────────────────────────
+function tailText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  if (value.length <= maxChars) return value;
+  return "...[truncated; showing tail]...\n" + value.slice(-maxChars);
+}
+
+const STALL_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+function isActiveRun(progress: ProgressState | null, review: ReviewPacketLike | null): boolean {
+  if (review) return false;
+  if (!progress) return false;
+  return !isTerminal(progress.status);
+}
+
+function statusView(runId: string, progress: ProgressState | null, review: ReviewPacketLike | null, meta: RunMeta | null, progressEvents: ProgressState[] = []) {
+  const active = isActiveRun(progress, review);
+  // Use lastActivityAt (real Codex activity) over updatedAt (bridge progress write)
+  const activityAt = progress?.lastActivityAt || progress?.updatedAt;
+  const secondsSinceActivity = active && activityAt
+    ? Math.max(0, Math.round((Date.now() - new Date(activityAt).getTime()) / 1000))
+    : undefined;
+  const stale = active && secondsSinceActivity !== undefined && secondsSinceActivity * 1000 > STALL_THRESHOLD_MS;
+  return {
+    run_id: runId,
+    async: true,
+    status: review?.status || progress?.status || "unknown",
+    status_detail: review?.status_detail,
+    failure_hint: review?.failure_hint,
+    review_ready: Boolean(review),
+    session_id: review?.session_id || progress?.sessionId,
+    progress: progress ? {
+      status: progress.status, message: progress.message,
+      updatedAt: progress.updatedAt, seq: progress.seq, elapsedMs: progress.elapsedMs,
+    } : undefined,
+    ...(progressEvents.length > 0 && {
+      progress_events: progressEvents.map((e) => ({ seq: e.seq, status: e.status, message: e.message, elapsedMs: e.elapsedMs })),
+    }),
+    seconds_since_last_activity: secondsSinceActivity,
+    stale,
+    ...(stale && { stale_warning: "No Codex activity for 5+ minutes. Ask the user whether to keep waiting or stop this run." }),
+    cwd: meta?.cwd,
+    git_root: meta?.gitRoot || undefined,
+    sandbox: meta?.sandbox,
+    timeout: meta?.timeout,
+    suggested_action: review ? "read_summary" : stale ? "ask_user_whether_to_continue_or_stop" : "continue_polling",
+    next_poll_after_seconds: review ? undefined : stale ? 60 : 20,
+  };
+}
+
+const SUMMARY_FILE_LIMIT = 40;
+const SUMMARY_LIST_LIMIT = 20;
+
+function capList<T>(items: T[] | undefined, limit: number): { items: T[]; total: number; truncated: boolean } {
+  const arr = items ?? [];
+  return { items: arr.slice(0, limit), total: arr.length, truncated: arr.length > limit };
+}
+
+function compactFiles(files: Array<{ path: string; status?: string; from?: string }> | undefined) {
+  const arr = files ?? [];
+  const byStatus: Record<string, number> = {};
+  for (const f of arr) { const k = f.status || "?"; byStatus[k] = (byStatus[k] || 0) + 1; }
+  return { total: arr.length, by_status: byStatus, items: arr.slice(0, SUMMARY_FILE_LIMIT), truncated: arr.length > SUMMARY_FILE_LIMIT };
+}
+
+function nextActionForReview(review: ReviewPacketLike): string {
+  if (review.partial_changes) return "inspect_diff_before_retry_or_revert";
+  if (review.status !== "completed") return "inspect_summary_then_decide_resume_or_restart";
+  if (review.git_diff?.risk_flags?.length) return "inspect_diff";
+  if (review.warnings?.length) return "read_warnings_then_decide";
+  if (review.git_diff?.diff_truncated) return "request_diff_view_if_needed";
+  return "review_summary_may_be_enough";
+}
+
+function compactReviewSummary(runId: string, review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  const gdCompact = gd && gd.is_git_repo ? {
+    changed: gd.changed, summary: gd.summary,
+    files: compactFiles(gd.files as Array<{ path: string; status?: string; from?: string }>),
+    diff_truncated: gd.diff_truncated, diff_preview_mode: gd.diff_preview_mode,
+    full_diff_bytes: gd.full_diff_bytes, preexisting_dirty_files: gd.preexisting_dirty_files,
+    risk_flags: capList(gd.risk_flags, SUMMARY_LIST_LIMIT),
+    sensitive_diff_omitted: capList(gd.sensitive_diff_omitted, SUMMARY_LIST_LIMIT),
+    diff_path: gd.diff_path,
+  } : gd;
+  return {
+    run_id: runId, async: true, review_ready: true,
+    status: review.status, status_detail: review.status_detail,
+    failure_hint: review.failure_hint, partial_changes: review.partial_changes,
+    session_id: review.session_id, session_name: review.session_name,
+    duration_ms: review.duration_ms,
+    token_usage: review.token_usage,
+    git_diff: gdCompact,
+    fs_sentinel: review.fs_sentinel,
+    warnings: capList(review.warnings, SUMMARY_LIST_LIMIT),
+    output_tail: tailText(review.output, Math.min(maxChars, 2000)),
+    output_source: review.output_source,
+    process: review.process,
+    next_action: nextActionForReview(review),
+  };
+}
+
+function limitReviewPacket(review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  const gdLimited = gd && gd.is_git_repo && gd.diff_preview
+    ? { ...gd, diff_preview: tailText(gd.diff_preview, maxChars) }
+    : gd;
+  return {
+    ...review,
+    output: tailText(review.output, maxChars),
+    stderr: tailText(review.stderr, Math.min(maxChars, 20000)),
+    git_diff: gdLimited,
+  };
+}
+
+function diffOnlyView(runId: string, review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  if (!gd || !gd.is_git_repo) {
+    return { run_id: runId, status: review.status, git_diff: gd };
+  }
+  return {
+    run_id: runId, status: review.status,
+    changed: gd.changed, summary: gd.summary,
+    files: compactFiles(gd.files as Array<{ path: string; status?: string; from?: string }>),
+    risk_flags: gd.risk_flags, sensitive_diff_omitted: gd.sensitive_diff_omitted,
+    diff_preview: tailText(gd.diff_preview, maxChars),
+    diff_truncated: gd.diff_truncated, diff_path: gd.diff_path,
+    full_diff_bytes: gd.full_diff_bytes,
+  };
+}
+
+function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, timeoutMs: number): Promise<void> {
+  if (timeoutMs <= 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    let done = false;
+    let watcher: ReturnType<typeof fsWatch> | undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { watcher?.close(); } catch {}
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      resolve();
+    };
+
+    const changed = () => {
+      markWorkerDeadIfNeeded(runDir);
+      if (readReviewPacket(runDir)) return true;
+      const progress = readProgress(runDir);
+      if (sinceSeq !== undefined && progress && progress.seq > sinceSeq) return true;
+      return Date.now() >= deadline;
+    };
+
+    const scheduleFallback = () => {
+      if (done) return;
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      const remaining = deadline - Date.now();
+      fallbackTimer = setTimeout(check, Math.min(2000, Math.max(250, remaining)));
+      fallbackTimer.unref?.();
+    };
+
+    const check = () => {
+      if (changed()) return finish();
+      scheduleFallback();
+    };
+
+    // Event-driven: watch runDir for progress.json / review.json changes
+    try {
+      watcher = fsWatch(runDir, { persistent: false }, (_event, filename) => {
+        if (done || !filename) return;
+        const f = String(filename);
+        if (f === "progress.json" || f === "review.json" || f.startsWith("progress.json.") || f.startsWith("review.json.")) {
+          check();
+        }
+      });
+      watcher.on("error", () => {
+        try { watcher?.close(); } catch {}
+        watcher = undefined;
+        scheduleFallback();
+      });
+    } catch {
+      // fs.watch unavailable — fallback only
+    }
+
+    check();
+  });
+}
+
 // ── MCP Server ───────────────────────────────────────────────────
-const server = new McpServer({ name: "codex-bridge", version: "2.1.0" });
+const server = new McpServer({ name: "codex-bridge", version: PKG_VERSION });
 const SB = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const EM = z.enum(["auto", "sync", "async"]);
 
@@ -245,7 +448,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   cwd: z.string(),
   model: z.string().optional(),
   sandbox: SB.optional().default("workspace-write"),
-  timeout: z.number().int().min(10).max(7200).optional().default(300),
+  timeout: z.number().int().min(10).max(7200).optional(),
   session_name: z.string().optional(),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
   allow_non_git: z.boolean().optional().default(false),
@@ -255,7 +458,8 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
   project_brief: z.boolean().optional().default(true),
 }, async (args) => {
-  const { task, model, sandbox, timeout, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
 
   let cwd: string;
   try { cwd = normalizeCwd(args.cwd); } catch (e: any) { return toolError(e.message); }
@@ -339,7 +543,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   cwd: z.string().optional(),
   sandbox: SB.optional(),
   model: z.string().optional(),
-  timeout: z.number().int().min(10).max(7200).optional().default(300),
+  timeout: z.number().int().min(10).max(7200).optional(),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
   allow_non_git: z.boolean().optional().default(false),
   allow_large_untracked_snapshot: z.boolean().optional().default(false),
@@ -348,7 +552,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
   project_brief: z.boolean().optional().default(true),
 }, async (args) => {
-  const { session_id, task, cwd: cwdArg, timeout, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { session_id, task, cwd: cwdArg, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
 
   const ex = lookupWithDurable(session_id);
   const rsid = ex?.sessionId || session_id;
@@ -376,6 +580,8 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   // Session-level active guard: prevent concurrent resume of same Codex thread
   const activeRun = findActiveRunForSession(rsid);
   if (activeRun) return toolError("Codex session already has an active run. Wait for it to finish or stop it before resuming.", { session_id: rsid, active_run_id: activeRun.runId, status: activeRun.status });
+
+  const timeout = args.timeout ?? defaultTimeoutFor(effectiveSandbox, execution_mode);
 
   const runId = randomUUID();
   const runDir = createRunDir(runId);
@@ -453,18 +659,24 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
 
 const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).optional();
 
+const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
+
 server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
   action: z.enum(["list", "get", "stop", "doctor"]),
   session_id: z.string().optional(),
   run_id: RunIdSchema,
+  view: VIEW.optional().default("status"),
+  max_chars: z.number().int().min(1000).max(200000).optional().default(20000),
+  wait_seconds: z.number().int().min(0).max(60).optional().default(0),
+  since_seq: z.number().int().min(0).optional(),
 }, async (args) => {
-  const { action, session_id: sid, run_id: rid } = args;
+  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, since_seq } = args;
 
   if (action === "doctor") {
     const stats = durableStateStats();
     const connectivity = await tcpProbe("api.openai.com", 443, 5000);
     return toolJson({
-      bridge_version: "2.1.0", codex_binary: CODEX_BINARY,
+      bridge_version: PKG_VERSION, codex_binary: CODEX_BINARY,
       codex_version: cmdOk(CODEX_BINARY, ["--version"]),
       git_version: cmdOk("git", ["--version"]),
       node: process.version, platform: process.platform, arch: process.arch,
@@ -499,10 +711,10 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
 
   // ── GET ────────────────────────────────────────────────────────
   if (action === "get") {
-    if (rid) return getByRunId(rid);
+    if (rid) return getByRunId(rid, view, max_chars, wait_seconds, since_seq);
     if (sid) {
       const runId = findRunIdBySessionId(sid);
-      if (runId) return getByRunId(runId);
+      if (runId) return getByRunId(runId, view, max_chars, wait_seconds, since_seq);
       return toolError("Session not found. Pass cwd to codex_resume.", { session_id: sid });
     }
     return toolError("session_id or run_id required for get");
@@ -536,34 +748,58 @@ function findRunIdBySessionId(sessionId: string): string | undefined {
 }
 
 // ── Action helpers ───────────────────────────────────────────────
-function getByRunId(rid: string) {
+async function getByRunId(
+  rid: string,
+  view: "status" | "summary" | "review" | "diff" | "output" = "status",
+  maxChars: number = 20000,
+  waitSeconds: number = 0,
+  sinceSeq?: number,
+) {
   const runDir = getRunDir(rid);
   if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
+
+  // Long-poll: wait for progress change or review completion
+  if (waitSeconds > 0) await waitForProgressOrReview(runDir, sinceSeq, waitSeconds * 1000);
 
   markWorkerDeadIfNeeded(runDir);
   const meta = readRunMeta(runDir);
   const progress = readProgress(runDir);
-  const review = readReviewPacket(runDir) as Record<string, unknown> | null;
+  const review = readReviewPacket(runDir) as ReviewPacketLike | null;
 
-  if (review) {
-    // Hydrate session into memory so subsequent resume can find it
-    hydrateSessionFromRun(rid);
+  // Hydrate session into memory so subsequent resume can find it
+  if (review) hydrateSessionFromRun(rid);
+
+  // status: always lightweight, even when review is ready
+  if (view === "status") {
+    const progressEvents = sinceSeq !== undefined
+      ? readProgressEventsSince(runDir, sinceSeq, 20)
+      : readProgressEventsSince(runDir, 0, 3); // first poll: show recent 3 events
+    return toolJson(statusView(rid, progress, review, meta, progressEvents));
+  }
+
+  // Other views need review to be ready
+  if (!review) {
     return toolJson({
-      run_id: rid,
-      status: review.status || progress?.status || "completed",
-      status_detail: review.status_detail,
-      partial_changes: review.partial_changes,
-      async: true,
-      review_ready: true,
-      review_packet: review,
+      ...statusView(rid, progress, review, meta),
+      message: "Review not ready. Use view='status' with wait_seconds to poll.",
     });
   }
 
-  return toolJson({
-    run_id: rid, status: progress?.status || "unknown", async: true,
-    progress, review_ready: false,
-    meta: meta ? { cwd: meta.cwd, gitRoot: meta.gitRoot, sandbox: meta.sandbox, sessionName: meta.sessionName, createdAt: meta.createdAt } : undefined,
-  });
+  if (view === "summary") return toolJson(compactReviewSummary(rid, review, maxChars));
+  if (view === "review") return toolJson(limitReviewPacket(review, maxChars));
+  if (view === "diff") return toolJson(diffOnlyView(rid, review, maxChars));
+  if (view === "output") {
+    return toolJson({
+      run_id: rid, status: review.status,
+      output: tailText(review.output, maxChars),
+      output_source: review.output_source,
+      output_truncated: review.output_truncated,
+      stderr: tailText(review.stderr, Math.min(maxChars, 20000)),
+      stderr_truncated: review.stderr_truncated,
+    });
+  }
+
+  return toolJson(statusView(rid, progress, review, meta));
 }
 
 function stopByRunId(rid: string) {
@@ -612,7 +848,7 @@ function stopByRunId(rid: string) {
 async function main() {
   cleanOldTmpDirs();
   cleanOldRuns();
-  process.stderr.write("codex-bridge v2.1.0 stable\n");
+  process.stderr.write(`codex-bridge v${PKG_VERSION} stable\n`);
   const t = new StdioServerTransport();
   await server.connect(t);
 }

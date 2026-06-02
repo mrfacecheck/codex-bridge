@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync, appendFileSync, renameSync, chmodSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync, appendFileSync, renameSync, chmodSync, openSync, closeSync, readSync } from "fs";
 import { createHash } from "crypto";
 import { homedir } from "os";
 import path from "path";
@@ -102,6 +102,7 @@ export function updateProgress(runDir: string, state: Partial<ProgressState>) {
     sessionId: state.sessionId ?? existing?.sessionId,
     elapsedMs: state.elapsedMs ?? existing?.elapsedMs,
     error: state.error ?? existing?.error,
+    lastActivityAt: state.lastActivityAt ?? existing?.lastActivityAt,
   };
   writeJsonAtomic(fp, next);
   try { appendFileSync(path.join(runDir, "progress.jsonl"), JSON.stringify(next) + "\n", { mode: 0o600 }); } catch {}
@@ -109,6 +110,38 @@ export function updateProgress(runDir: string, state: Partial<ProgressState>) {
 
 export function readProgress(runDir: string): ProgressState | null {
   return readJson<ProgressState>(path.join(runDir, "progress.json"));
+}
+
+const PROGRESS_TAIL_BYTES = 32 * 1024; // read last 32KB to avoid full-file load
+
+export function readProgressEventsSince(runDir: string, sinceSeq: number = 0, limit: number = 20): ProgressState[] {
+  const fp = path.join(runDir, "progress.jsonl");
+  let text = "";
+  try {
+    const stat = statSync(fp);
+    if (stat.size <= PROGRESS_TAIL_BYTES) {
+      text = readFileSync(fp, "utf8");
+    } else {
+      // Read only the tail to avoid memory issues on long runs
+      const fd = openSync(fp, "r");
+      const buf = Buffer.alloc(PROGRESS_TAIL_BYTES);
+      readSync(fd, buf, 0, PROGRESS_TAIL_BYTES, stat.size - PROGRESS_TAIL_BYTES);
+      closeSync(fd);
+      text = buf.toString("utf8");
+      // Skip first partial line
+      const nl = text.indexOf("\n");
+      if (nl >= 0) text = text.slice(nl + 1);
+    }
+  } catch { return []; }
+  const out: ProgressState[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const p = JSON.parse(line) as ProgressState;
+      if (p.seq > sinceSeq) out.push(p);
+    } catch {}
+  }
+  return out.slice(-limit);
 }
 
 // ── Cancel Protocol ──────────────────────────────────────────────
