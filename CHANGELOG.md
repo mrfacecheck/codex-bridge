@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.1
+
+### Fixed
+- **Proxy env completeness**: `buildCodexEnv()` now mirrors all proxy variables to both cases and derives `ALL_PROXY`/`all_proxy` from `HTTP_PROXY`. Previously only passed uppercase `HTTP_PROXY`/`HTTPS_PROXY` and derived `WS_PROXY`/`WSS_PROXY`, missing lowercase variants and `ALL_PROXY` that Codex CLI's internal network-proxy module expects.
+
 ## 2.1.0
 
 Architecture upgrade from synchronous blocking to bounded sync + async worker.

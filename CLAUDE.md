@@ -39,5 +39,5 @@ npm pack --dry-run     # 预览发布内容
 
 - **GitHub：** https://github.com/mrfacecheck/codex-bridge
 - **npm：** https://www.npmjs.com/package/@codex-bridge/core
-- **版本：** 2.1.0
+- **版本：** 2.1.1
 - **许可证：** MIT
