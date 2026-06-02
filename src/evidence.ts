@@ -34,7 +34,31 @@ export function buildSafeEnv(keys: Set<string>): NodeJS.ProcessEnv {
   e.PATH ||= "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
   return e;
 }
-export function buildCodexEnv(): NodeJS.ProcessEnv { return buildSafeEnv(SAFE_ENV); }
+export function buildCodexEnv(): NodeJS.ProcessEnv {
+  const e = buildSafeEnv(SAFE_ENV);
+  // Mirror proxy env vars: derive missing variants from what's available.
+  // Codex CLI reads uppercase for its own API connection (HTTP CONNECT → WSS),
+  // Codex network-proxy reads both cases for sandbox child processes.
+  const httpProxy = e.HTTP_PROXY || e.HTTPS_PROXY || e.http_proxy || e.https_proxy;
+  if (httpProxy) {
+    e.HTTP_PROXY  ||= httpProxy;
+    e.HTTPS_PROXY ||= httpProxy;
+    e.ALL_PROXY   ||= httpProxy;
+    e.WS_PROXY    ||= httpProxy;
+    e.WSS_PROXY   ||= httpProxy;
+    e.http_proxy  ||= httpProxy;
+    e.https_proxy ||= httpProxy;
+    e.all_proxy   ||= httpProxy;
+    e.ws_proxy    ||= httpProxy;
+    e.wss_proxy   ||= httpProxy;
+  }
+  const noProxy = e.NO_PROXY || e.no_proxy;
+  if (noProxy) {
+    e.NO_PROXY ||= noProxy;
+    e.no_proxy ||= noProxy;
+  }
+  return e;
+}
 export function buildGitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const e = buildSafeEnv(SAFE_ENV);
   e.GIT_EXTERNAL_DIFF = "";
