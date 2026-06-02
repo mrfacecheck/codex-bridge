@@ -14,6 +14,7 @@ export const SAFE_ENV = new Set([
   "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
   "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
   "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+  "WS_PROXY", "WSS_PROXY", "ws_proxy", "wss_proxy",
 ]);
 
 export const SENSITIVE_RE = /(^|\/)(.*\.env(\..*)?|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|.*\.(pem|key|p12|pfx|crt))$/i;
