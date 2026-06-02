@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.2.0
+
+Interaction protocol upgrade: view-based progressive retrieval, long-poll, dynamic timeout.
+
+### Added
+- **View system**: `codex_sessions get` now supports `view` parameter (`status`|`summary`|`review`|`diff`|`output`). Default is `status` — lightweight JSON for polling. `summary` returns diff stats + warnings + output tail without full diff. `review`/`diff`/`output` return specific slices.
+- **Long-poll**: `wait_seconds` parameter (0-60) lets Claude wait for progress changes or completion in a single call instead of sleep+poll cycles. `since_seq` parameter triggers early return when progress advances.
+- **Dynamic timeout**: `timeout` no longer defaults to 300s for all tasks. read-only→300s, async→1200s, write→900s. Eliminates most premature kills on complex tasks.
+- **`max_chars` control**: Limits output/diff/stderr size in responses. Default 20000. Prevents context window pollution.
+
+### Changed
+- **Default `wait_budget_seconds`**: 180→60. Users see async handle within 1 minute instead of waiting 3 minutes.
+- **`getByRunId` rewritten**: Now accepts view/maxChars/waitSeconds/sinceSeq. Returns view-appropriate response instead of always dumping full review packet.
+- `ReviewPacketLike` type expanded to cover all fields worker actually writes (failure_hint, duration_ms, events, fs_sentinel, warnings, etc.).
+
 ## 2.1.1
 
 ### Fixed

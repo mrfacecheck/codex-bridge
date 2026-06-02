@@ -154,18 +154,43 @@ export interface RunHandle {
 // ── v2: Review Packet (typed subset for in-process use) ──────────
 export interface ReviewPacketLike {
   run_id?: string;
+  async?: boolean;
   session_id?: string;
-  status?: RunStatus;
+  session_name?: string;
+  status?: RunStatus | string;
   status_detail?: string;
-  output?: string;
-  token_usage?: TokenUsage;
-  resume_attached?: boolean;
+  failure_hint?: string;
   partial_changes?: boolean;
+  cwd?: string;
+  git_root?: string;
+  duration_ms?: number;
+  output?: string;
+  output_source?: string;
+  output_truncated?: boolean;
+  stderr?: string;
+  stderr_truncated?: boolean;
+  process?: { exit_code: number | null; signal: string | null };
+  token_usage?: TokenUsage;
+  events?: EventSummary;
   git_diff?: {
     is_git_repo?: boolean;
     changed?: boolean;
-    files?: Array<{ path: string }>;
+    files?: Array<{ path: string; status?: string; from?: string }>;
     diff_path?: string;
+    diff_preview?: string;
+    diff_preview_mode?: string;
+    diff_truncated?: boolean;
     summary?: string;
+    full_diff_bytes?: number;
+    preexisting_dirty_files?: number;
+    risk_flags?: string[];
+    sensitive_diff_omitted?: string[];
   };
+  fs_sentinel?: unknown;
+  warnings?: string[];
+  resume_attached?: boolean;
+  resume_context_verified?: boolean;
+  requested_session_id?: string;
+  actual_session_id?: string;
+  sandbox?: string;
 }

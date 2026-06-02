@@ -1,6 +1,6 @@
 {
   "name": "@codex-bridge/core",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "MCP evidence layer bridging Claude Code and OpenAI Codex — run-scoped git diff, sensitive content protection, multi-turn session management",
   "type": "module",
   "bin": {

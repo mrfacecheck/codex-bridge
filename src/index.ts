@@ -25,8 +25,14 @@ const __dirname = path.dirname(__filename);
 const WORKER_EXT = path.extname(__filename); // ".ts" in dev, ".js" in compiled
 const WORKER_SCRIPT = path.join(__dirname, `worker${WORKER_EXT}`);
 
-const DEFAULT_WAIT_BUDGET = 180;
+const DEFAULT_WAIT_BUDGET = 60;
 const MAX_WAIT_BUDGET = 240;
+
+function defaultTimeoutFor(sandbox: string, mode: string): number {
+  if (sandbox === "read-only") return 300;
+  if (mode === "async") return 1200;
+  return 900;
+}
 
 // ── Network Probe ────────────────────────────────────────────────
 function tcpProbe(host: string, port: number, timeoutMs: number): Promise<{ reachable: boolean; latencyMs: number; error?: string }> {
@@ -61,7 +67,7 @@ function sessionFromRun(runId: string): Session | undefined {
   const review = readReviewPacket(runDir) as ReviewPacketLike | null;
   if (review?.resume_attached === false) return undefined;
   const sessionId = review?.session_id || progress?.sessionId;
-  const status: Session["status"] = review?.status || (progress?.status as Session["status"]) || "running";
+  const status: Session["status"] = (review?.status as Session["status"]) || (progress?.status as Session["status"]) || "running";
   return {
     latestRunId: runId, runIds: [runId], sessionId,
     name: meta.sessionName, status, cwd: meta.cwd,
@@ -235,8 +241,103 @@ function buildProjectBrief(cwd: string, gitRoot: string | null): string | null {
   return `Project context:\n${parts.join("\n")}\n---\n`;
 }
 
+// ── View Helpers ────────────────────────────────────────────────
+function tailText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  if (value.length <= maxChars) return value;
+  return "...[truncated; showing tail]...\n" + value.slice(-maxChars);
+}
+
+function statusView(runId: string, progress: ProgressState | null, review: ReviewPacketLike | null, meta: RunMeta | null) {
+  return {
+    run_id: runId,
+    async: true,
+    status: review?.status || progress?.status || "unknown",
+    status_detail: review?.status_detail,
+    failure_hint: review?.failure_hint,
+    review_ready: Boolean(review),
+    session_id: review?.session_id || progress?.sessionId,
+    progress: progress ? {
+      status: progress.status, message: progress.message,
+      updatedAt: progress.updatedAt, seq: progress.seq, elapsedMs: progress.elapsedMs,
+    } : undefined,
+    cwd: meta?.cwd,
+    git_root: meta?.gitRoot || undefined,
+    next_poll_after_seconds: review ? undefined : 20,
+  };
+}
+
+function compactReviewSummary(runId: string, review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  const gdCompact = gd && gd.is_git_repo ? {
+    changed: gd.changed, summary: gd.summary, files: gd.files,
+    diff_truncated: gd.diff_truncated, diff_preview_mode: gd.diff_preview_mode,
+    full_diff_bytes: gd.full_diff_bytes, preexisting_dirty_files: gd.preexisting_dirty_files,
+    risk_flags: gd.risk_flags, sensitive_diff_omitted: gd.sensitive_diff_omitted,
+    diff_path: gd.diff_path,
+  } : gd;
+  return {
+    run_id: runId, async: true, review_ready: true,
+    status: review.status, status_detail: review.status_detail,
+    failure_hint: review.failure_hint, partial_changes: review.partial_changes,
+    session_id: review.session_id, session_name: review.session_name,
+    duration_ms: review.duration_ms,
+    token_usage: review.token_usage,
+    git_diff: gdCompact,
+    fs_sentinel: review.fs_sentinel,
+    warnings: review.warnings || [],
+    output_tail: tailText(review.output, Math.min(maxChars, 2000)),
+    output_source: review.output_source,
+    process: review.process,
+  };
+}
+
+function limitReviewPacket(review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  const gdLimited = gd && gd.is_git_repo && gd.diff_preview
+    ? { ...gd, diff_preview: tailText(gd.diff_preview, maxChars) }
+    : gd;
+  return {
+    ...review,
+    output: tailText(review.output, maxChars),
+    stderr: tailText(review.stderr, Math.min(maxChars, 20000)),
+    git_diff: gdLimited,
+  };
+}
+
+function diffOnlyView(runId: string, review: ReviewPacketLike, maxChars: number) {
+  const gd = review.git_diff;
+  if (!gd || !gd.is_git_repo) {
+    return { run_id: runId, status: review.status, git_diff: gd };
+  }
+  return {
+    run_id: runId, status: review.status,
+    changed: gd.changed, summary: gd.summary, files: gd.files,
+    risk_flags: gd.risk_flags, sensitive_diff_omitted: gd.sensitive_diff_omitted,
+    diff_preview: tailText(gd.diff_preview, maxChars),
+    diff_truncated: gd.diff_truncated, diff_path: gd.diff_path,
+    full_diff_bytes: gd.full_diff_bytes,
+  };
+}
+
+function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, timeoutMs: number): Promise<void> {
+  if (timeoutMs <= 0) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const check = () => {
+      markWorkerDeadIfNeeded(runDir);
+      if (readReviewPacket(runDir)) return resolve();
+      const progress = readProgress(runDir);
+      if (sinceSeq !== undefined && progress && progress.seq > sinceSeq) return resolve();
+      if (Date.now() >= deadline) return resolve();
+      const t = setTimeout(check, 1000); t.unref();
+    };
+    check();
+  });
+}
+
 // ── MCP Server ───────────────────────────────────────────────────
-const server = new McpServer({ name: "codex-bridge", version: "2.1.0" });
+const server = new McpServer({ name: "codex-bridge", version: "2.2.0" });
 const SB = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const EM = z.enum(["auto", "sync", "async"]);
 
@@ -245,7 +346,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   cwd: z.string(),
   model: z.string().optional(),
   sandbox: SB.optional().default("workspace-write"),
-  timeout: z.number().int().min(10).max(7200).optional().default(300),
+  timeout: z.number().int().min(10).max(7200).optional(),
   session_name: z.string().optional(),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
   allow_non_git: z.boolean().optional().default(false),
@@ -255,7 +356,8 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
   project_brief: z.boolean().optional().default(true),
 }, async (args) => {
-  const { task, model, sandbox, timeout, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
 
   let cwd: string;
   try { cwd = normalizeCwd(args.cwd); } catch (e: any) { return toolError(e.message); }
@@ -339,7 +441,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   cwd: z.string().optional(),
   sandbox: SB.optional(),
   model: z.string().optional(),
-  timeout: z.number().int().min(10).max(7200).optional().default(300),
+  timeout: z.number().int().min(10).max(7200).optional(),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
   allow_non_git: z.boolean().optional().default(false),
   allow_large_untracked_snapshot: z.boolean().optional().default(false),
@@ -348,7 +450,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
   project_brief: z.boolean().optional().default(true),
 }, async (args) => {
-  const { session_id, task, cwd: cwdArg, timeout, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { session_id, task, cwd: cwdArg, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
 
   const ex = lookupWithDurable(session_id);
   const rsid = ex?.sessionId || session_id;
@@ -376,6 +478,8 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
   // Session-level active guard: prevent concurrent resume of same Codex thread
   const activeRun = findActiveRunForSession(rsid);
   if (activeRun) return toolError("Codex session already has an active run. Wait for it to finish or stop it before resuming.", { session_id: rsid, active_run_id: activeRun.runId, status: activeRun.status });
+
+  const timeout = args.timeout ?? defaultTimeoutFor(effectiveSandbox, execution_mode);
 
   const runId = randomUUID();
   const runDir = createRunDir(runId);
@@ -453,18 +557,24 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
 
 const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).optional();
 
+const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
+
 server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
   action: z.enum(["list", "get", "stop", "doctor"]),
   session_id: z.string().optional(),
   run_id: RunIdSchema,
+  view: VIEW.optional().default("status"),
+  max_chars: z.number().int().min(1000).max(200000).optional().default(20000),
+  wait_seconds: z.number().int().min(0).max(60).optional().default(0),
+  since_seq: z.number().int().min(0).optional(),
 }, async (args) => {
-  const { action, session_id: sid, run_id: rid } = args;
+  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, since_seq } = args;
 
   if (action === "doctor") {
     const stats = durableStateStats();
     const connectivity = await tcpProbe("api.openai.com", 443, 5000);
     return toolJson({
-      bridge_version: "2.1.0", codex_binary: CODEX_BINARY,
+      bridge_version: "2.2.0", codex_binary: CODEX_BINARY,
       codex_version: cmdOk(CODEX_BINARY, ["--version"]),
       git_version: cmdOk("git", ["--version"]),
       node: process.version, platform: process.platform, arch: process.arch,
@@ -499,10 +609,10 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
 
   // ── GET ────────────────────────────────────────────────────────
   if (action === "get") {
-    if (rid) return getByRunId(rid);
+    if (rid) return getByRunId(rid, view, max_chars, wait_seconds, since_seq);
     if (sid) {
       const runId = findRunIdBySessionId(sid);
-      if (runId) return getByRunId(runId);
+      if (runId) return getByRunId(runId, view, max_chars, wait_seconds, since_seq);
       return toolError("Session not found. Pass cwd to codex_resume.", { session_id: sid });
     }
     return toolError("session_id or run_id required for get");
@@ -536,34 +646,55 @@ function findRunIdBySessionId(sessionId: string): string | undefined {
 }
 
 // ── Action helpers ───────────────────────────────────────────────
-function getByRunId(rid: string) {
+async function getByRunId(
+  rid: string,
+  view: "status" | "summary" | "review" | "diff" | "output" = "status",
+  maxChars: number = 20000,
+  waitSeconds: number = 0,
+  sinceSeq?: number,
+) {
   const runDir = getRunDir(rid);
   if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
+
+  // Long-poll: wait for progress change or review completion
+  if (waitSeconds > 0) await waitForProgressOrReview(runDir, sinceSeq, waitSeconds * 1000);
 
   markWorkerDeadIfNeeded(runDir);
   const meta = readRunMeta(runDir);
   const progress = readProgress(runDir);
-  const review = readReviewPacket(runDir) as Record<string, unknown> | null;
+  const review = readReviewPacket(runDir) as ReviewPacketLike | null;
 
-  if (review) {
-    // Hydrate session into memory so subsequent resume can find it
-    hydrateSessionFromRun(rid);
+  // Hydrate session into memory so subsequent resume can find it
+  if (review) hydrateSessionFromRun(rid);
+
+  // status: always lightweight, even when review is ready
+  if (view === "status") {
+    return toolJson(statusView(rid, progress, review, meta));
+  }
+
+  // Other views need review to be ready
+  if (!review) {
     return toolJson({
-      run_id: rid,
-      status: review.status || progress?.status || "completed",
-      status_detail: review.status_detail,
-      partial_changes: review.partial_changes,
-      async: true,
-      review_ready: true,
-      review_packet: review,
+      ...statusView(rid, progress, review, meta),
+      message: "Review not ready. Use view='status' with wait_seconds to poll.",
     });
   }
 
-  return toolJson({
-    run_id: rid, status: progress?.status || "unknown", async: true,
-    progress, review_ready: false,
-    meta: meta ? { cwd: meta.cwd, gitRoot: meta.gitRoot, sandbox: meta.sandbox, sessionName: meta.sessionName, createdAt: meta.createdAt } : undefined,
-  });
+  if (view === "summary") return toolJson(compactReviewSummary(rid, review, maxChars));
+  if (view === "review") return toolJson(limitReviewPacket(review, maxChars));
+  if (view === "diff") return toolJson(diffOnlyView(rid, review, maxChars));
+  if (view === "output") {
+    return toolJson({
+      run_id: rid, status: review.status,
+      output: tailText(review.output, maxChars),
+      output_source: review.output_source,
+      output_truncated: review.output_truncated,
+      stderr: tailText(review.stderr, Math.min(maxChars, 20000)),
+      stderr_truncated: review.stderr_truncated,
+    });
+  }
+
+  return toolJson(statusView(rid, progress, review, meta));
 }
 
 function stopByRunId(rid: string) {
@@ -612,7 +743,7 @@ function stopByRunId(rid: string) {
 async function main() {
   cleanOldTmpDirs();
   cleanOldRuns();
-  process.stderr.write("codex-bridge v2.1.0 stable\n");
+  process.stderr.write("codex-bridge v2.2.0 stable\n");
   const t = new StdioServerTransport();
   await server.connect(t);
 }
