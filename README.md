@@ -16,8 +16,11 @@ Claude Code ──[MCP]──▶ codex-bridge ──▶ Codex CLI
 
 ## Quick start
 
+Canonical distribution is GitHub (npm registry is stale at 2.2.7):
+
 ```bash
-npm install -g @codex-bridge/core
+npm install -g github:mrfacecheck/codex-bridge
+# or pin a tag: npm install -g github:mrfacecheck/codex-bridge#v2.3.2
 claude mcp add codex-bridge -- npx codex-bridge
 ```
 
