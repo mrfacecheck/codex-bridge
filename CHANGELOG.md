@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.3.3
+
+- Deterministic model evidence: every run records `model`/`model_source` (flag|config|unknown), `effort`/`effort_source`, and `codex_version`. Codex JSONL emits no model field, so resolution reads the same config.toml Codex reads; unknown stays unknown. Surfaced in status, list, summary, and review views.
+- New regression test covering the resolution matrix (config.toml, flag override, honest unknown).
+
 ## 2.3.1
 
 ### Fixed

@@ -54,6 +54,36 @@ function tcpProbe(host: string, port: number, timeoutMs: number): Promise<{ reac
   });
 }
 
+// ── Codex model/effort resolution ────────────────────────────────
+// Codex JSONL emits no model field, so resolve what Codex itself will use:
+// explicit -m/-c flags first, then the same config.toml Codex reads.
+// Unknown stays unknown — never guess.
+function readCodexConfigKey(key: string): string | null {
+  try {
+    const home = process.env.CODEX_HOME || path.join(process.env.HOME ?? "", ".codex");
+    const txt = readFileSync(path.join(home, "config.toml"), "utf8");
+    const m = txt.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, "m"));
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+let cachedCodexVersion: string | undefined;
+function resolveCodexRunConfig(model?: string, effort?: string) {
+  const cfgModel = readCodexConfigKey("model");
+  const cfgEffort = readCodexConfigKey("model_reasoning_effort");
+  if (cachedCodexVersion === undefined) {
+    const v = cmdOk(CODEX_BINARY, ["--version"]);
+    cachedCodexVersion = v.ok ? v.output : undefined;
+  }
+  return {
+    resolvedModel: model ?? cfgModel,
+    modelSource: (model ? "flag" : cfgModel ? "config" : "unknown") as "flag" | "config" | "unknown",
+    resolvedEffort: effort ?? cfgEffort,
+    effortSource: (effort ? "flag" : cfgEffort ? "config" : "unknown") as "flag" | "config" | "unknown",
+    codexVersion: cachedCodexVersion,
+  };
+}
+
 // ── MCP Response Helpers ─────────────────────────────────────────
 function toolJson(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
@@ -305,6 +335,11 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
     isolation: meta?.isolation,
     sandbox: meta?.sandbox,
     timeout: meta?.timeout,
+    model: meta?.resolvedModel ?? meta?.model ?? null,
+    model_source: meta?.modelSource,
+    effort: meta?.resolvedEffort ?? meta?.effort ?? null,
+    effort_source: meta?.effortSource,
+    codex_version: meta?.codexVersion,
     suggested_action: review ? "read_summary" : stale ? "ask_user_whether_to_continue_or_stop" : "continue_polling",
     next_poll_after_seconds: review ? undefined : stale ? 60 : 20,
   };
@@ -351,6 +386,9 @@ function compactReviewSummary(runId: string, review: ReviewPacketLike, maxChars:
     failure_hint: review.failure_hint, partial_changes: review.partial_changes,
     session_id: review.session_id, session_name: review.session_name,
     duration_ms: review.duration_ms,
+    model: review.model, model_source: review.model_source,
+    effort: review.effort, effort_source: review.effort_source,
+    codex_version: review.codex_version,
     token_usage: review.token_usage,
     git_diff: gdCompact,
     fs_sentinel: review.fs_sentinel,
@@ -526,6 +564,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
     createdAt: new Date().toISOString(),
     isolation, worktreePath, parentGitRoot: useWorktree ? gitRoot : undefined,
     effort, outputSchema: output_schema,
+    ...resolveCodexRunConfig(model, effort),
   };
   writeRunMeta(runDir, meta);
 
@@ -639,6 +678,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
     createdAt: new Date().toISOString(), resumeSessionId: rsid,
     resumeContextVerified,
+    ...resolveCodexRunConfig(args.model, undefined),
   };
   writeRunMeta(runDir, meta);
 
@@ -741,6 +781,8 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
           sandbox: r.meta.sandbox,
           created_at: r.meta.createdAt,
           session_id: progress?.sessionId || (review?.session_id as string),
+          model: r.meta.resolvedModel ?? r.meta.model ?? null,
+          model_source: r.meta.modelSource,
           message: progress?.message,
         };
       }),

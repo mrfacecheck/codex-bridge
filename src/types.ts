@@ -131,6 +131,11 @@ export interface RunMeta {
   parentGitRoot?: string | null;
   effort?: string;
   outputSchema?: string;
+  resolvedModel?: string | null;
+  modelSource?: "flag" | "config" | "unknown";
+  resolvedEffort?: string | null;
+  effortSource?: "flag" | "config" | "unknown";
+  codexVersion?: string;
 }
 
 export interface ProgressState {
@@ -200,4 +205,9 @@ export interface ReviewPacketLike {
   requested_session_id?: string;
   actual_session_id?: string;
   sandbox?: string;
+  model?: string | null;
+  model_source?: string;
+  effort?: string | null;
+  effort_source?: string;
+  codex_version?: string;
 }

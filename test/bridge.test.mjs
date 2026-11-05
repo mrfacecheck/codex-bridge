@@ -1,7 +1,7 @@
 /** Deterministic offline regression suite for codex-bridge via stub-codex. */
 import { test, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, rmSync, unlinkSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnBridge, makeRepo, git, waitFor, setStubControl } from "./helpers.mjs";
@@ -183,4 +183,55 @@ test("cleanup removes worktree", async () => {
 	const c = await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
 	assert.match(JSON.stringify(c), /clean|remov|ok|true/i);
 	if (wt) assert.ok(!existsSync(wt), "worktree should be removed");
+});
+
+test("model resolution: config.toml, flag override, and honest unknown", async () => {
+	const cfgHome = mkdtempSync(join(tmpdir(), "cb-codexhome-"));
+	writeFileSync(join(cfgHome, "config.toml"), 'model = "fixture-gpt"\nmodel_reasoning_effort = "low"\n');
+	const b = spawnBridge({ CODEX_HOME: cfgHome });
+	await b.init();
+	try {
+		setStubControl({ mode: "success" });
+		const r1 = await b.call("codex_exec", {
+			task: "x", cwd: repo, isolation: "inplace",
+			execution_mode: "auto", wait_budget_seconds: 30, timeout: 60,
+		});
+		const st1 = await b.call("codex_sessions", { action: "get", run_id: r1.run_id });
+		assert.equal(st1.model, "fixture-gpt");
+		assert.equal(st1.model_source, "config");
+		assert.equal(st1.effort, "low");
+		assert.equal(st1.effort_source, "config");
+		assert.ok(st1.codex_version, "codex_version recorded");
+		const sum1 = await b.call("codex_sessions", { action: "get", run_id: r1.run_id, view: "summary" });
+		assert.equal(sum1.model, "fixture-gpt", "review packet carries model");
+
+		const r2 = await b.call("codex_exec", {
+			task: "x", cwd: repo, isolation: "inplace", model: "flag-model-x",
+			execution_mode: "auto", wait_budget_seconds: 30, timeout: 60,
+		});
+		const st2 = await b.call("codex_sessions", { action: "get", run_id: r2.run_id });
+		assert.equal(st2.model, "flag-model-x");
+		assert.equal(st2.model_source, "flag");
+	} finally {
+		b.close();
+		rmSync(cfgHome, { recursive: true, force: true });
+	}
+
+	const emptyHome = mkdtempSync(join(tmpdir(), "cb-codexhome-empty-"));
+	const b2 = spawnBridge({ CODEX_HOME: emptyHome });
+	await b2.init();
+	try {
+		setStubControl({ mode: "success" });
+		const r3 = await b2.call("codex_exec", {
+			task: "x", cwd: repo, isolation: "inplace",
+			execution_mode: "auto", wait_budget_seconds: 30, timeout: 60,
+		});
+		const st3 = await b2.call("codex_sessions", { action: "get", run_id: r3.run_id });
+		assert.equal(st3.model, null);
+		assert.equal(st3.model_source, "unknown");
+	} finally {
+		b2.close();
+		rmSync(emptyHome, { recursive: true, force: true });
+	}
+	rmSync(join(repo, "OUT.txt"), { force: true });
 });

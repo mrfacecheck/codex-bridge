@@ -184,6 +184,11 @@ async function main() {
       isolation: meta.isolation,
       worktree_path: meta.worktreePath,
       parent_git_root: meta.parentGitRoot ?? undefined,
+      model: meta.resolvedModel ?? meta.model ?? null,
+      model_source: meta.modelSource,
+      effort: meta.resolvedEffort ?? meta.effort ?? null,
+      effort_source: meta.effortSource,
+      codex_version: meta.codexVersion,
     };
 
     if (resumeSessionId) {
