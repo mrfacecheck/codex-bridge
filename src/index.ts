@@ -282,7 +282,8 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
   const stale = active && secondsSinceActivity !== undefined && secondsSinceActivity * 1000 > STALL_THRESHOLD_MS;
   return {
     run_id: runId,
-    async: true,
+    // async mirrors the completed packet's flag once review exists; a live run is by definition on the async path.
+    async: review?.async ?? true,
     status: review?.status || progress?.status || "unknown",
     status_detail: review?.status_detail,
     failure_hint: review?.failure_hint,
@@ -515,7 +516,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   }
   if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
   if (non_goals) finalTask += `\n\nNon-goals (do NOT do these):\n${non_goals}`;
-  if (useWorktree) finalTask += `\n\nConstraints: you are inside an isolated git worktree. Work only within this directory; do not commit, do not push.`;
+  if (useWorktree) finalTask += `\n\nConstraints: your ONLY writable directory is ${worktreePath}. The checkout at ${gitRoot} is read-only context — do not create, modify, or delete files there or anywhere outside your worktree. Do not commit, do not push.`;
 
   const meta: RunMeta = {
     runId, cwd: effectiveCwd, gitRoot: gitRepo ? gitRoot : null, sandbox, task: finalTask,

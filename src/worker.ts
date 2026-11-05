@@ -53,6 +53,9 @@ async function main() {
     sw.push(...fsBR.warnings);
     const pd = gitRepo ? getWorktreeStatus(gitRoot) : [];
     bT = gitRepo ? snapshotWorktreeTree(gitRoot) : undefined;
+    // Escape detection: in worktree mode also snapshot the parent checkout's
+    // status so writes outside the worktree are caught, not silently missed.
+    const parentStatusBefore = meta.parentGitRoot ? getWorktreeStatus(meta.parentGitRoot) : [];
 
     updateProgress(runDir, { status: "running", message: "Starting Codex" });
 
@@ -98,6 +101,13 @@ async function main() {
     const oT = ft ? Boolean(fm?.truncated) : result.outputTruncated;
 
     const w: string[] = [...sw];
+    if (meta.parentGitRoot) {
+      const before = new Set(parentStatusBefore.map((f) => `${f.xy}:${f.path}`));
+      const escaped = getWorktreeStatus(meta.parentGitRoot).filter((f) => !before.has(`${f.xy}:${f.path}`));
+      if (escaped.length > 0) {
+        w.push(`WORKTREE ESCAPE: worker modified ${escaped.length} path(s) in the parent checkout (${meta.parentGitRoot}): ${escaped.map((f) => f.path).slice(0, 10).join(", ")}. These changes are OUTSIDE the run diff.`);
+      }
+    }
     if (!gitRepo) w.push("Non-git directory: no diff captured.");
     if (pd.length > 0) w.push(`Worktree had ${pd.length} pre-existing dirty file(s); diff is scoped to this run.`);
     if (fsc.length > 0) w.push(`Ignored sensitive file(s) changed: ${fsc.map((c) => `${c.kind}:${c.path}`).join(", ")}`);

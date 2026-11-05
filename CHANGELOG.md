@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.1
+
+### Fixed
+- **Worktree escape detection**: in `isolation=worktree` mode the worker snapshots the parent checkout's `git status` before and after the run; any paths the worker modified outside its worktree surface as `WORKTREE ESCAPE` warnings, since the run-scoped diff cannot see them. Codex's workspace-write boundary is the repo family, not the worktree dir, so prompt-level discipline is required — the exec contract now names the worktree as the only writable path and the parent checkout as read-only.
+- **`async` flag consistency**: `statusView`/`get` now mirror the completed packet's `async` value instead of always reporting `true`.
+
 ## 2.3.0
 
 ### Added
