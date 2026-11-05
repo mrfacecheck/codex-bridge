@@ -392,6 +392,27 @@ export function killTree(proc: ChildProcess, sig: NodeJS.Signals = "SIGTERM") {
 export function killPidTree(pid: number, sig: NodeJS.Signals = "SIGTERM") {
   try { process.kill(-pid, sig); } catch { try { process.kill(pid, sig); } catch {} }
 }
+
+// ps -o command= truncates long argv, so a runId near the tail can be invisible.
+// Walking the ppid chain is a truncation-proof liveness check.
+export function pidParent(pid: number): number | undefined {
+  try {
+    const s = execFileSync("ps", ["-p", String(pid), "-o", "ppid="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4096 }).trim();
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  } catch { return undefined; }
+}
+
+export function pidDescendantOf(pid: number, ancestorPid: number, maxDepth = 10): boolean {
+  let cur = pid;
+  for (let i = 0; i < maxDepth; i++) {
+    const p = pidParent(cur);
+    if (!p || p === cur) return false;
+    if (p === ancestorPid) return true;
+    cur = p;
+  }
+  return false;
+}
 export function pidCommand(pid: number): string {
   try { return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4096 }).trim(); } catch { return ""; }
 }

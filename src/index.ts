@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn, execFileSync } from "child_process";
+import { spawn, execFileSync, spawnSync } from "child_process";
 import { connect as tcpConnect } from "net";
-import { existsSync, statSync, readFileSync, watch as fsWatch } from "fs";
+import { existsSync, statSync, readFileSync, mkdirSync, openSync, closeSync, watch as fsWatch } from "fs";
 import { randomUUID } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -10,7 +10,7 @@ import { z } from "zod";
 import { isTerminal, RECENT_RUN_LOOKUP_LIMIT, ACTIVE_SESSION_SCAN_LIMIT, type RunMeta, type ProgressState, type RunHandle, type RunHandleStatus, type Session, type ReviewPacketLike, type TokenUsage } from "./types.js";
 import {
   CODEX_BINARY, normalizeCwd, resolveExecContext,
-  checkWriteLockConflict, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun,
+  checkWriteLockConflict, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun, pidDescendantOf,
 } from "./evidence.js";
 import {
   createRunDir, writeRunMeta, readRunMeta, readProgress, readProgressEventsSince,
@@ -18,8 +18,10 @@ import {
   pollForCompletion, updateProjectPointer, getRunDir, runDirExists,
   listRuns, cleanOldRuns, requestCancel, markWorkerDeadIfNeeded,
   assertRunId, updateProgress as updateProgressFile,
-  getLatestRunForSession, durableStateStats,
+  getLatestRunForSession, durableStateStats, RUNS_DIR,
 } from "./progress.js";
+
+const WT_DIR = path.join(path.dirname(RUNS_DIR), "wt");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -177,7 +179,13 @@ function workerCommand(runDir: string): WorkerCommand {
 
 function spawnWorker(runDir: string): number | undefined {
   const { command, args } = workerCommand(runDir);
-  const child = spawn(command, args, { stdio: "ignore", detached: true, env: process.env });
+  // Redirect worker stdout/stderr to runDir/worker.log instead of a black hole —
+  // crash diagnostics need somewhere to land.
+  let outFd: number | "ignore" = "ignore";
+  try { outFd = openSync(path.join(runDir, "worker.log"), "a", 0o600); } catch {}
+  const stdio: Array<number | "ignore"> = ["ignore", outFd, outFd];
+  const child = spawn(command, args, { stdio, detached: true, env: process.env });
+  if (outFd !== "ignore") { try { closeSync(outFd); } catch {} }
   child.unref();
   return child.pid;
 }
@@ -212,6 +220,7 @@ function buildRunHandle(runId: string, meta: RunMeta, progress: ProgressState | 
     session_id: progress?.sessionId,
     cwd: meta.cwd,
     git_root: meta.gitRoot || undefined,
+    worktree_path: meta.worktreePath,
     progress: progress || INITIAL_PROGRESS,
     poll_with: `codex_sessions get --run_id ${runId}`,
   };
@@ -291,6 +300,8 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
     ...(stale && { stale_warning: "No Codex activity for 5+ minutes. Ask the user whether to keep waiting or stop this run." }),
     cwd: meta?.cwd,
     git_root: meta?.gitRoot || undefined,
+    worktree_path: meta?.worktreePath,
+    isolation: meta?.isolation,
     sandbox: meta?.sandbox,
     timeout: meta?.timeout,
     suggested_action: review ? "read_summary" : stale ? "ask_user_whether_to_continue_or_stop" : "continue_polling",
@@ -383,6 +394,9 @@ function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, t
   if (timeoutMs <= 0) return Promise.resolve();
   return new Promise<void>((resolve) => {
     const deadline = Date.now() + timeoutMs;
+    // Baseline: when no cursor is given, wake on any progress newer than the state at call time.
+    // Without this, first polls (no since_seq) could only be woken by review.json or the deadline.
+    const baseline = sinceSeq ?? readProgress(runDir)?.seq ?? 0;
     let done = false;
     let watcher: ReturnType<typeof fsWatch> | undefined;
     let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
@@ -399,7 +413,7 @@ function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, t
       markWorkerDeadIfNeeded(runDir);
       if (readReviewPacket(runDir)) return true;
       const progress = readProgress(runDir);
-      if (sinceSeq !== undefined && progress && progress.seq > sinceSeq) return true;
+      if (progress && progress.seq > baseline) return true;
       return Date.now() >= deadline;
     };
 
@@ -457,8 +471,14 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   execution_mode: EM.optional().default("auto"),
   wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
   project_brief: z.boolean().optional().default(true),
+  isolation: z.enum(["inplace", "worktree"]).optional().default("inplace"),
+  base: z.string().optional(),
+  effort: z.string().optional(),
+  acceptance: z.string().optional(),
+  non_goals: z.string().optional(),
+  output_schema: z.string().optional(),
 }, async (args) => {
-  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema } = args;
   const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
 
   let cwd: string;
@@ -467,8 +487,10 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
 
   const { runCwd, gitRoot, gitRepo } = resolveExecContext(cwd);
   if (!gitRepo && !allow_non_git) return toolError("Not a Git repo. Set allow_non_git=true.", { cwd: runCwd });
+  if (isolation === "worktree" && !gitRepo) return toolError("isolation=worktree requires a git repo.");
 
-  if (sandbox !== "read-only") {
+  const useWorktree = isolation === "worktree" && sandbox !== "read-only";
+  if (sandbox !== "read-only" && !useWorktree) {
     const conflict = checkWriteLockConflict(gitRepo ? gitRoot : runCwd);
     if (conflict) return toolError(conflict);
   }
@@ -476,18 +498,33 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   const runId = randomUUID();
   const runDir = createRunDir(runId);
 
-  let finalTask = task;
-  if (project_brief) {
-    const brief = buildProjectBrief(runCwd, gitRepo ? gitRoot : null);
-    if (brief) finalTask = brief + task;
+  let worktreePath: string | undefined;
+  let effectiveCwd = runCwd;
+  if (useWorktree) {
+    worktreePath = path.join(WT_DIR, runId);
+    mkdirSync(path.dirname(worktreePath), { recursive: true });
+    const add = spawnSync("git", ["-C", gitRoot as string, "worktree", "add", "--detach", worktreePath, base ?? "HEAD"], { encoding: "utf8" });
+    if (add.status !== 0) return toolError(`worktree add failed: ${(add.stderr || add.stdout || "").trim()}`, { worktree: worktreePath });
+    effectiveCwd = worktreePath;
   }
 
+  let finalTask = task;
+  if (project_brief) {
+    const brief = buildProjectBrief(effectiveCwd, gitRepo ? gitRoot : null);
+    if (brief) finalTask = brief + task;
+  }
+  if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
+  if (non_goals) finalTask += `\n\nNon-goals (do NOT do these):\n${non_goals}`;
+  if (useWorktree) finalTask += `\n\nConstraints: you are inside an isolated git worktree. Work only within this directory; do not commit, do not push.`;
+
   const meta: RunMeta = {
-    runId, cwd: runCwd, gitRoot: gitRepo ? gitRoot : null, sandbox, task: finalTask,
+    runId, cwd: effectiveCwd, gitRoot: gitRepo ? gitRoot : null, sandbox, task: finalTask,
     model, timeout, sessionName: session_name || `run-${runId.slice(0, 8)}`,
     maxDiffChars: max_diff_chars, allowNonGit: allow_non_git,
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
     createdAt: new Date().toISOString(),
+    isolation, worktreePath, parentGitRoot: useWorktree ? gitRoot : undefined,
+    effort, outputSchema: output_schema,
   };
   writeRunMeta(runDir, meta);
 
@@ -662,7 +699,7 @@ const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
 
 server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
-  action: z.enum(["list", "get", "stop", "doctor"]),
+  action: z.enum(["list", "get", "stop", "doctor", "cleanup"]),
   session_id: z.string().optional(),
   run_id: RunIdSchema,
   view: VIEW.optional().default("status"),
@@ -730,6 +767,19 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
     return toolError("session_id or run_id required for stop");
   }
 
+  // ── CLEANUP (worktree runs) ───────────────────────────────────
+  if (action === "cleanup") {
+    if (!rid) return toolError("run_id required for cleanup");
+    if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
+    const rd = getRunDir(rid);
+    const meta = readRunMeta(rd);
+    if (!meta?.worktreePath) return toolJson({ cleaned: false, reason: "Run did not use isolation=worktree." });
+    if (!existsSync(meta.worktreePath)) return toolJson({ cleaned: true, worktree: meta.worktreePath, note: "Worktree already gone." });
+    const base = meta.parentGitRoot ?? meta.gitRoot;
+    const r = spawnSync("git", ["-C", base as string, "worktree", "remove", "--force", meta.worktreePath], { encoding: "utf8" });
+    return toolJson({ cleaned: r.status === 0, worktree: meta.worktreePath, stderr: (r.stderr || "").trim() || undefined });
+  }
+
   return toolError("Unknown action");
 });
 
@@ -772,8 +822,8 @@ async function getByRunId(
   // status: always lightweight, even when review is ready
   if (view === "status") {
     const progressEvents = sinceSeq !== undefined
-      ? readProgressEventsSince(runDir, sinceSeq, 20)
-      : readProgressEventsSince(runDir, 0, 3); // first poll: show recent 3 events
+      ? readProgressEventsSince(runDir, sinceSeq, 20, "after")
+      : readProgressEventsSince(runDir, 0, 3, "recent"); // first poll: show recent 3 events
     return toolJson(statusView(rid, progress, review, meta, progressEvents));
   }
 
@@ -811,7 +861,9 @@ function stopByRunId(rid: string) {
   const progress = readProgress(runDir);
   const review = readReviewPacket(runDir) as ReviewPacketLike | null;
 
-  const codexAlive = Boolean(meta.codexPid) && pidAlive(meta.codexPid!) && pidLooksLikeCodexForRun(meta.codexPid!, rid);
+  const codexAlive = Boolean(meta.codexPid) && pidAlive(meta.codexPid!)
+    && (pidLooksLikeCodexForRun(meta.codexPid!, rid)
+        || (meta.workerPid ? pidDescendantOf(meta.codexPid!, meta.workerPid) : false));
 
   if ((review || isTerminal(progress?.status)) && !codexAlive) {
     return toolJson({ cancellation_requested: false, run_id: rid, status: review?.status || progress?.status, reason: "Run is not active." });

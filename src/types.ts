@@ -126,6 +126,11 @@ export interface RunMeta {
   resumeSessionId?: string;
   resumeContextVerified?: boolean;
   projectBrief?: boolean;
+  isolation?: "inplace" | "worktree";
+  worktreePath?: string;
+  parentGitRoot?: string | null;
+  effort?: string;
+  outputSchema?: string;
 }
 
 export interface ProgressState {
@@ -148,6 +153,7 @@ export interface RunHandle {
   session_id?: string;
   cwd: string;
   git_root?: string;
+  worktree_path?: string;
   progress: ProgressState;
   poll_with: string;
 }

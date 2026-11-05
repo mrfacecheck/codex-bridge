@@ -58,7 +58,12 @@ async function main() {
 
     const fmp = path.join(runDir, "final-message.md");
     ensurePrivateFile(fmp);
-    const ca = buildCodexArgs(runCwd, sandbox, model, fmp, gitRepo, allowNonGit, resumeSessionId);
+    let outputSchemaPath: string | undefined;
+    if (meta.outputSchema) {
+      outputSchemaPath = path.join(runDir, "output-schema.json");
+      try { writeFileSync(outputSchemaPath, meta.outputSchema, { mode: 0o600 }); } catch { outputSchemaPath = undefined; }
+    }
+    const ca = buildCodexArgs(runCwd, sandbox, model, fmp, gitRepo, allowNonGit, resumeSessionId, meta.effort, outputSchemaPath);
 
     const result = await runCodexWorker(runId, ca, runCwd, timeout, task, runDir, wl);
 
@@ -166,6 +171,9 @@ async function main() {
       git_diff: gd,
       fs_sentinel: fsc.length > 0 ? { watched: "ignored sensitive files", changes: fsc } : undefined,
       warnings: w,
+      isolation: meta.isolation,
+      worktree_path: meta.worktreePath,
+      parent_git_root: meta.parentGitRoot ?? undefined,
     };
 
     if (resumeSessionId) {
@@ -203,17 +211,20 @@ function ensurePrivateFile(fp: string) {
   closeSync(fd);
 }
 
-function buildCodexArgs(runCwd: string, sandbox: string, model: string | undefined, fmp: string, gitRepo: boolean, allowNonGit: boolean, resumeSessionId?: string): string[] {
+function buildCodexArgs(runCwd: string, sandbox: string, model: string | undefined, fmp: string, gitRepo: boolean, allowNonGit: boolean, resumeSessionId?: string, effort?: string, outputSchemaPath?: string): string[] {
   if (resumeSessionId) {
     const ca = ["exec", "resume", resumeSessionId, "--json", "-c", 'approval_policy="never"', "-o", fmp];
     if (!gitRepo && allowNonGit) ca.push("--skip-git-repo-check");
     if (model) ca.push("-m", model);
+    if (effort) ca.push("-c", `model_reasoning_effort="${effort}"`);
     ca.push("-");
     return ca;
   }
   const ca = ["exec", "--json", "--color", "never", "-C", runCwd, "-s", sandbox, "-c", 'approval_policy="never"', "-o", fmp];
   if (!gitRepo && allowNonGit) ca.push("--skip-git-repo-check");
   if (model) ca.push("-m", model);
+  if (effort) ca.push("-c", `model_reasoning_effort="${effort}"`);
+  if (outputSchemaPath) ca.push("--output-schema", outputSchemaPath);
   ca.push("-");
   return ca;
 }
@@ -281,20 +292,12 @@ function runCodexWorker(runId: string, args: string[], cwd: string, timeout: num
     }, 30_000);
     stallTimer.unref();
 
-    function isImportantProgress(m: string): boolean {
-      return m.startsWith("Session started") || m.startsWith("Error") || m.startsWith("Done")
-        || m.startsWith("Running:") || m.startsWith("Editing:") || m.startsWith("Saved:")
-        || m.startsWith("Timeout") || m.startsWith("Cancellation");
-    }
-
     function onP(m: string) {
       progressSeq++;
       lastEventAt = Date.now();
       stallWarned = false;
       if (noResponseTimer && !noResponseFired) { clearTimeout(noResponseTimer); noResponseTimer = undefined; }
-      if (progressSeq % 3 === 0 || isImportantProgress(m)) {
-        updateProgress(workerRunDir, { status: cancelReq ? "cancelling" : "running", message: sanitize(m), sessionId: sid || undefined, elapsedMs: Date.now() - t0, lastActivityAt: new Date().toISOString() });
-      }
+      updateProgress(workerRunDir, { status: cancelReq ? "cancelling" : "running", message: sanitize(m), sessionId: sid || undefined, elapsedMs: Date.now() - t0, lastActivityAt: new Date().toISOString() });
     }
 
     // Cancel protocol: poll cancel.requested file

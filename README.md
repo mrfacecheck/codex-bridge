@@ -61,9 +61,9 @@ Core decisions:
 
 | Tool | Purpose |
 |------|---------|
-| `codex_exec` | Start task. Params: `task`, `cwd`, `sandbox`, `timeout`, `execution_mode`, `wait_budget_seconds` |
+| `codex_exec` | Start task. Params: `task`, `cwd`, `sandbox`, `timeout`, `execution_mode`, `wait_budget_seconds`, `isolation` (`inplace`\|`worktree`), `base`, `model`, `effort`, `acceptance`, `non_goals`, `output_schema` |
 | `codex_resume` | Continue session. Params: `session_id`, `task` |
-| `codex_sessions` | Manage runs. Actions: `list`, `get`, `stop`, `doctor`. Get params: `view`, `wait_seconds`, `since_seq`, `max_chars` |
+| `codex_sessions` | Manage runs. Actions: `list`, `get`, `stop`, `doctor`, `cleanup`. Get params: `view`, `wait_seconds`, `since_seq`, `max_chars` |
 
 ## Source
 

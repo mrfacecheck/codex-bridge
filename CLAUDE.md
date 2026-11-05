@@ -4,12 +4,13 @@ Claude 与 Codex 之间的 MCP 证据层。Claude 出方案做审查，Codex 写
 
 ## 调用规范
 
-1. **task**: 自包含的详细规范。Codex 不知道之前的对话，prompt 必须完整
+1. **task**: 自包含的详细规范。Codex 不知道之前的对话，prompt 必须完整。建议配 `acceptance`（验收标准，worker 完成前自查）和 `non_goals`（明确不做的事）
 2. **cwd**: 项目根目录绝对路径
-3. **model**: 不要指定。省略让 Codex CLI 使用默认模型（自动跟随官方最新版本）
+3. **model / effort**: 默认省略让 Codex CLI 跟随最新默认。编排路由场景可显式指定（如 `model: "gpt-6.1-sol", effort: "xhigh"`）
 4. **sandbox**: 默认 "workspace-write"，除非任务明确只需要读
-5. **同一任务的修复/迭代**: 用 `codex_resume`（保持上下文），不要新建 session
-6. **不相关的新任务**: 用 `codex_exec` 新建 session
+5. **isolation**: 默认 "inplace"（直接改工作树，同 repo 写锁串行）。"worktree" 把运行放进 `~/.codex-bridge/wt/<run_id>` 的隔离 worktree——**不碰调用方工作树、同 repo 可并行、diff 天然只含本次变更**；编排派单场景优先用它，完成后 `codex_sessions cleanup` 回收
+6. **同一任务的修复/迭代**: 用 `codex_resume`（保持上下文），不要新建 session
+7. **不相关的新任务**: 用 `codex_exec` 新建 session
 
 ## 默认执行策略
 

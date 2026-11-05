@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync, appendFileSync, renameSync, chmodSync, openSync, closeSync, readSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync, appendFileSync, renameSync, chmodSync, openSync, closeSync, readSync, watch } from "fs";
 import { createHash } from "crypto";
 import { homedir } from "os";
 import path from "path";
@@ -112,9 +112,9 @@ export function readProgress(runDir: string): ProgressState | null {
   return readJson<ProgressState>(path.join(runDir, "progress.json"));
 }
 
-const PROGRESS_TAIL_BYTES = 32 * 1024; // read last 32KB to avoid full-file load
+const PROGRESS_TAIL_BYTES = 128 * 1024; // read last 128KB to avoid full-file load
 
-export function readProgressEventsSince(runDir: string, sinceSeq: number = 0, limit: number = 20): ProgressState[] {
+export function readProgressEventsSince(runDir: string, sinceSeq: number = 0, limit: number = 20, mode: "after" | "recent" = "after"): ProgressState[] {
   const fp = path.join(runDir, "progress.jsonl");
   let text = "";
   try {
@@ -141,7 +141,9 @@ export function readProgressEventsSince(runDir: string, sinceSeq: number = 0, li
       if (p.seq > sinceSeq) out.push(p);
     } catch {}
   }
-  return out.slice(-limit);
+  // Cursor mode: return earliest unseen events so the client can paginate without loss.
+  // Recent mode: return the tail for display purposes.
+  return mode === "after" ? out.slice(0, limit) : out.slice(-limit);
 }
 
 // ── Cancel Protocol ──────────────────────────────────────────────
@@ -297,24 +299,48 @@ export function durableStateStats(): { totalBytes: number; runCount: number; ses
 }
 
 // ── Poll ─────────────────────────────────────────────────────────
-export function pollForCompletion(runDir: string, timeoutMs: number, intervalMs = 500): Promise<unknown | null> {
+// Watch-driven with short fallback: resolves the moment review.json lands or a terminal
+// state is detected, instead of sleeping through a fixed tick.
+export function pollForCompletion(runDir: string, timeoutMs: number, _intervalMs = 250): Promise<unknown | null> {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
-    function check() {
+    let done = false;
+    let watcher: ReturnType<typeof watch> | undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (packet: unknown | null) => {
+      if (done) return;
+      done = true;
+      try { watcher?.close(); } catch {}
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      resolve(packet);
+    };
+
+    const check = () => {
       const packet = readReviewPacket(runDir);
-      if (packet) { resolve(packet); return; }
+      if (packet) { finish(packet); return; }
 
       const progress = markWorkerDeadIfNeeded(runDir);
       if (progress && (progress.status === "failed" || progress.status === "timeout" || progress.status === "cancelled")) {
-        const failPacket = readReviewPacket(runDir);
-        resolve(failPacket);
+        finish(readReviewPacket(runDir));
         return;
       }
 
-      if (Date.now() >= deadline) { resolve(null); return; }
-      const t = setTimeout(check, intervalMs);
-      t.unref();
-    }
+      if (Date.now() >= deadline) { finish(null); return; }
+      const remaining = deadline - Date.now();
+      fallbackTimer = setTimeout(check, Math.min(250, Math.max(50, remaining)));
+      fallbackTimer.unref?.();
+    };
+
+    try {
+      watcher = watch(runDir, { persistent: false }, (_event, filename) => {
+        if (done || !filename) return;
+        const f = String(filename);
+        if (f === "review.json" || f.startsWith("review.json.") || f === "progress.json" || f.startsWith("progress.json.")) check();
+      });
+      watcher.on("error", () => { try { watcher?.close(); } catch {} watcher = undefined; });
+    } catch { /* fs.watch unavailable — fallback only */ }
+
     check();
   });
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.3.0
+
+### Added
+- **`isolation=worktree`**: Runs execute inside a dedicated `git worktree` under `~/.codex-bridge/wt/<run_id>` instead of the live checkout. Workers no longer touch the caller's working tree, runs on the same repo can proceed in parallel (the write-lock is per-worktree), and the run-scoped diff is by construction free of pre-existing dirty files. `base` selects the starting ref (default `HEAD`).
+- **`codex_sessions cleanup`**: Removes a run's worktree (`git worktree remove --force`).
+- **`effort` param**: Passed through to Codex as `-c model_reasoning_effort="<value>"` on both exec and resume, enabling per-run reasoning-tier routing.
+- **`output_schema` param**: JSON schema written to the run dir and passed via `--output-schema`, forcing a structured final message from the worker.
+- **`acceptance` / `non_goals` params**: Rendered into the task as an explicit contract block (acceptance criteria to verify, non-goals to avoid) — aligns the worker prompt with spec-driven delegation.
+- **`worker.log`**: Worker stdout/stderr now captured per run under the run dir. Previously `stdio:"ignore"` made worker crashes invisible.
+- **Review/status fields**: `isolation`, `worktree_path`, `parent_git_root` are now reported in the run handle, status view, and review packet.
+
+### Fixed
+- **Long-poll first-call stall**: `waitForProgressOrReview` now baselines the seq cursor at call time when `since_seq` is absent. Previously a poll without a cursor could only be woken by `review.json` or the deadline, so every first poll silently burned the full `wait_seconds`.
+- **Silent event loss**: `readProgressEventsSince` returned the *tail* `limit` events after the cursor, permanently skipping intermediate events. Cursor pagination now returns the *earliest* unseen events; tail semantics kept for the no-cursor "recent N" display.
+- **Progress thinning**: The worker persisted only every 3rd progress event, causing long silent stretches that looked like stalls. Every parsed Codex event now reaches `progress.jsonl`/`progress.json`.
+- **Completion latency**: `pollForCompletion` replaced the flat 500ms `setTimeout` loop with `fs.watch` + short fallback, so sync waits resolve the moment `review.json` lands.
+- **ps truncation false-negative**: `pidLooksLikeCodexForRun` could fail on long argv (`ps -o command=` truncates), making `stop` report "not active" while Codex kept running. Liveness now also accepts `codexPid` being a descendant of the verified `workerPid` via the ppid chain.
+- **Event tail window**: `PROGRESS_TAIL_BYTES` raised 32KB → 128KB to reduce cursor-unreachable history on chatty runs.
+
 ## 2.2.7
 
 ### Fixed
