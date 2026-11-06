@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.3.4
+
+- Context-economy pass on `codex_sessions`: `wait_seconds` ceiling raised 60 → 240 (one long-poll covers up to 4 minutes of a quiet run, cutting model round-trips ~4×), and `action:"list"` now returns compact rows by default (`verbose: true` restores the full field set) — real sessions produced 6.4k-token truncated list dumps.
+- Poll-cadence guidance updated: `next_poll_after_seconds` suggests 60s/120s instead of 20s/60s, tool description and CLAUDE.md document the 240s ceiling.
+
 ## v2.3.3
 
 - Deterministic model evidence: every run records `model`/`model_source` (flag|config|unknown), `effort`/`effort_source`, and `codex_version`. Codex JSONL emits no model field, so resolution reads the same config.toml Codex reads; unknown stays unknown. Surfaced in status, list, summary, and review views.

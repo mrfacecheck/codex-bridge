@@ -341,7 +341,7 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
     effort_source: meta?.effortSource,
     codex_version: meta?.codexVersion,
     suggested_action: review ? "read_summary" : stale ? "ask_user_whether_to_continue_or_stop" : "continue_polling",
-    next_poll_after_seconds: review ? undefined : stale ? 60 : 20,
+    next_poll_after_seconds: review ? undefined : stale ? 120 : 60,
   };
 }
 
@@ -739,16 +739,17 @@ const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 
 const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
 
-server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
+server.tool("codex_sessions", "List, inspect, stop, or diagnose. Poll view='status' with wait_seconds (up to 240) to long-poll instead of tight looping.", {
   action: z.enum(["list", "get", "stop", "doctor", "cleanup"]),
   session_id: z.string().optional(),
   run_id: RunIdSchema,
   view: VIEW.optional().default("status"),
   max_chars: z.number().int().min(1000).max(200000).optional().default(20000),
-  wait_seconds: z.number().int().min(0).max(60).optional().default(0),
+  wait_seconds: z.number().int().min(0).max(240).optional().default(0),
+  verbose: z.boolean().optional().default(false),
   since_seq: z.number().int().min(0).optional(),
 }, async (args) => {
-  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, since_seq } = args;
+  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, verbose, since_seq } = args;
 
   if (action === "doctor") {
     const stats = durableStateStats();
@@ -772,15 +773,19 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose.", {
         markWorkerDeadIfNeeded(rd);
         const progress = readProgress(rd);
         const review = readReviewPacket(rd) as Record<string, unknown> | null;
-        return {
+        const compact = {
           run_id: r.runId,
           session_name: r.meta.sessionName,
           status: (review?.status as string) || progress?.status || "unknown",
           cwd: r.meta.cwd,
-          git_root: r.meta.gitRoot,
-          sandbox: r.meta.sandbox,
           created_at: r.meta.createdAt,
           session_id: progress?.sessionId || (review?.session_id as string),
+        };
+        if (!verbose) return compact;
+        return {
+          ...compact,
+          git_root: r.meta.gitRoot,
+          sandbox: r.meta.sandbox,
           model: r.meta.resolvedModel ?? r.meta.model ?? null,
           model_source: r.meta.modelSource,
           message: progress?.message,

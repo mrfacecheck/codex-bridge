@@ -35,11 +35,11 @@ Claude 与 Codex 之间的 MCP 证据层。Claude 出方案做审查，Codex 写
 2. 不要启动同一 repo 的第二个 workspace-write run
 3. 用轻量 status 视图 + long-poll 轮询：
    ```json
-   { "action": "get", "run_id": "<run_id>", "view": "status", "wait_seconds": 20, "since_seq": <last_seq> }
+   { "action": "get", "run_id": "<run_id>", "view": "status", "wait_seconds": 120, "since_seq": <last_seq> }
    ```
-4. 轮询节奏：第 1 次 wait_seconds=20，第 2 次 30，第 3 次起 60
-5. 单回合最多轮询 4-6 次
-6. 未完成不要 stop，向用户说明后台继续，保留 run_id
+4. 轮询节奏：第 1 次 wait_seconds=60，第 2 次 120，第 3 次起 240（单次上限 240；客户端 MCP 超时较紧时自行降档）
+5. 单回合最多轮询 2-3 次——wait_seconds 已经覆盖等待，不要密集轮询
+6. 未完成不要 stop，向用户说明后台继续，保留 run_id；`action:"list"` 默认紧凑字段，需要全量细节时传 `verbose: true`
 7. 如果 status 返回 `stale: true`（5 分钟无新事件），向用户说明 Codex 可能卡住，询问是否 stop
 7. 当 `review_ready: true` 时，先取 summary 再决定是否看 diff
 
