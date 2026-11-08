@@ -5,7 +5,10 @@ import path from "path";
 import type { RunMeta, ProgressState, ProgressPhase } from "./types.js";
 import { pidAlive, pidLooksLikeBridgeWorker } from "./evidence.js";
 
-const BASE_DIR = path.join(homedir(), ".codex-bridge");
+// cx166 seam a1: seat-spawned bridge instances can't write ~/.codex-bridge under the
+// commander sandbox; CODEX_BRIDGE_HOME lets the launcher redirect the run home into a
+// seat-writable domain (e.g. /private/tmp/ppx-audit/codex-bridge-runs).
+const BASE_DIR = process.env.CODEX_BRIDGE_HOME ?? path.join(homedir(), ".codex-bridge");
 const RUNS_DIR = path.join(BASE_DIR, "runs");
 const PROJECTS_DIR = path.join(BASE_DIR, "projects");
 
