@@ -20,6 +20,7 @@ import {
   assertRunId, updateProgress as updateProgressFile,
   getLatestRunForSession, durableStateStats, RUNS_DIR,
 } from "./progress.js";
+import { GrantRejection, normalizeGrants, resolveMcpHome } from "./grants.js";
 
 const WT_DIR = path.join(path.dirname(RUNS_DIR), "wt");
 
@@ -516,8 +517,9 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   acceptance: z.string().optional(),
   non_goals: z.string().optional(),
   output_schema: z.string().optional(),
+  grants_mcp: z.array(z.string()).optional(),
 }, async (args) => {
-  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema } = args;
+  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema, grants_mcp } = args;
   const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
 
   let cwd: string;
@@ -556,6 +558,17 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   if (non_goals) finalTask += `\n\nNon-goals (do NOT do these):\n${non_goals}`;
   if (useWorktree) finalTask += `\n\nConstraints: your ONLY writable directory is ${worktreePath}. The checkout at ${gitRoot} is read-only context — do not create, modify, or delete files there or anywhere outside your worktree. Do not commit, do not push.`;
 
+  // cx137/capability-surface §G3: workers run in a shadow CODEX_HOME with a
+  // zero-MCP default; only grants_mcp servers are provisioned there (whitelist,
+  // fail-closed — plugin servers and ungranted config are absent by design).
+  let mcpHome: string | undefined;
+  try {
+    mcpHome = resolveMcpHome(normalizeGrants({ mcp: grants_mcp ?? [] }), runCwd, runDir).codexHome;
+  } catch (e: any) {
+    const details = e instanceof GrantRejection ? e.toDetails() : undefined;
+    return toolError(e?.message ?? String(e), details);
+  }
+
   const meta: RunMeta = {
     runId, cwd: effectiveCwd, gitRoot: gitRepo ? gitRoot : null, sandbox, task: finalTask,
     model, timeout, sessionName: session_name || `run-${runId.slice(0, 8)}`,
@@ -564,6 +577,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
     createdAt: new Date().toISOString(),
     isolation, worktreePath, parentGitRoot: useWorktree ? gitRoot : undefined,
     effort, outputSchema: output_schema,
+    mcpHome, grants: { mcp: grants_mcp ?? [] },
     ...resolveCodexRunConfig(model, effort),
   };
   writeRunMeta(runDir, meta);
@@ -670,6 +684,17 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     if (brief) finalTask = brief + task;
   }
 
+  // cx141 ruling §1: a resumed run must reuse the parent run's shadow
+  // CODEX_HOME — the session file lives inside it. Falling back to the real
+  // home would lose the session AND re-widen the MCP surface; fail closed.
+  const parentRunId = ex?.latestRunId;
+  const parentMeta = parentRunId && runDirExists(parentRunId) ? readRunMeta(getRunDir(parentRunId)) : null;
+  if (!parentMeta?.mcpHome) {
+    return toolError("cannot resume: no parent run with a shadow CODEX_HOME to inherit (pre-grants or external session). Fail closed — start a fresh codex_exec.", { session_id, parent_run_id: parentRunId ?? null });
+  }
+  const mcpHome = parentMeta.mcpHome;
+  const inheritedGrants = parentMeta.grants ?? { mcp: [] };
+
   const meta: RunMeta = {
     runId, cwd: runCwd, gitRoot: gitRepo ? gitRoot : null, sandbox: effectiveSandbox,
     task: finalTask, model: args.model, timeout,
@@ -678,6 +703,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
     createdAt: new Date().toISOString(), resumeSessionId: rsid,
     resumeContextVerified,
+    mcpHome, grants: inheritedGrants,
     ...resolveCodexRunConfig(args.model, undefined),
   };
   writeRunMeta(runDir, meta);

@@ -136,6 +136,8 @@ export interface RunMeta {
   resolvedEffort?: string | null;
   effortSource?: "flag" | "config" | "unknown";
   codexVersion?: string;
+  mcpHome?: string;
+  grants?: { mcp?: string[] };
 }
 
 export interface ProgressState {

@@ -31,6 +31,13 @@ if (args.includes("--version")) {
 	process.exit(0);
 }
 
+// grants path (cx137): codex mcp list --json — control file can inject a
+// server list; default is an empty MCP surface.
+if (args[0] === "mcp" && args[1] === "list") {
+	process.stdout.write(JSON.stringify(ctl.mcp_servers ?? []) + "\n");
+	process.exit(0);
+}
+
 const isResume = args[1] === "resume";
 const resumeSid = isResume ? args[2] : null;
 const oIdx = args.indexOf("-o");

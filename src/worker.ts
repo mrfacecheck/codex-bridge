@@ -68,7 +68,7 @@ async function main() {
     }
     const ca = buildCodexArgs(runCwd, sandbox, model, fmp, gitRepo, allowNonGit, resumeSessionId, meta.effort, outputSchemaPath);
 
-    const result = await runCodexWorker(runId, ca, runCwd, timeout, task, runDir, wl);
+    const result = await runCodexWorker(runId, ca, runCwd, timeout, task, runDir, wl, meta.mcpHome);
 
     if (gitRepo && !allowLargeUntracked) {
       try { assertSnapshotSafe(gitRoot, 256); } catch (e: any) {
@@ -250,14 +250,14 @@ interface WorkerCodexResult {
   tokenUsage: TokenUsage; events: EventSummary; durationMs: number; jsonlOverflowCount: number;
 }
 
-function runCodexWorker(runId: string, args: string[], cwd: string, timeout: number, stdin: string, workerRunDir: string, wl?: WriteLock): Promise<WorkerCodexResult> {
+function runCodexWorker(runId: string, args: string[], cwd: string, timeout: number, stdin: string, workerRunDir: string, wl?: WriteLock, mcpHome?: string): Promise<WorkerCodexResult> {
   const t0 = Date.now();
   const stdoutPath = path.join(workerRunDir, "codex.stdout.jsonl");
   const stderrPath = path.join(workerRunDir, "codex.stderr.log");
   const stdoutStream = createWriteStream(stdoutPath, { flags: "a", mode: 0o600 });
   const stderrStream = createWriteStream(stderrPath, { flags: "a", mode: 0o600 });
 
-  const proc = spawn(CODEX_BINARY, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env: buildCodexEnv(), detached: process.platform !== "win32" });
+  const proc = spawn(CODEX_BINARY, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env: mcpHome ? { ...buildCodexEnv(), CODEX_HOME: mcpHome } : buildCodexEnv(), detached: process.platform !== "win32" });
   if (wl && proc.pid) wl.attachChildPid(proc.pid);
   updateRunMeta(workerRunDir, { codexPid: proc.pid });
 
