@@ -1,7 +1,7 @@
 {
   "name": "@codex-bridge/core",
-  "version": "2.3.4",
-  "description": "MCP evidence layer bridging Claude Code and OpenAI Codex \u2014 run-scoped git diff, sensitive content protection, multi-turn session management",
+  "version": "2.3.7",
+  "description": "MCP evidence layer bridging MCP coding agents (Antigravity, Claude Code, etc.) and OpenAI Codex \u2014 run-scoped git diff, worktree isolation, sensitive content protection, multi-turn session management",
   "type": "module",
   "bin": {
     "codex-bridge": "./bin/codex-bridge.mjs"
@@ -11,6 +11,7 @@
     "bin",
     "README.md",
     "README.zh-CN.md",
+    "SKILL.md",
     "LICENSE"
   ],
   "scripts": {
@@ -25,10 +26,12 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "antigravity",
     "claude",
     "codex",
     "openai",
     "anthropic",
+    "gemini",
     "ai-collaboration",
     "code-review",
     "git-diff",

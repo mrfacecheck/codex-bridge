@@ -31,22 +31,28 @@ export function spawnBridge(extraEnv = {}) {
 			if (msg.id != null && pending.has(msg.id)) {
 				const p = pending.get(msg.id);
 				pending.delete(msg.id);
+				clearTimeout(p.timer);
 				msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
 			}
 		}
 	});
 	const rpc = (method, params, timeoutMs = 60_000) => new Promise((resolve, reject) => {
 		const id = nextId++;
-		pending.set(id, { resolve, reject });
+		const timer = setTimeout(() => { if (pending.delete(id)) reject(new Error(`${method} timeout`)); }, timeoutMs);
+		timer.unref?.();
+		pending.set(id, { resolve, reject, timer });
 		proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-		setTimeout(() => { if (pending.delete(id)) reject(new Error(`${method} timeout`)); }, timeoutMs);
 	});
 	return {
 		proc,
 		get stderr() { return stderr; },
 		async init() {
-			await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
+			const res = await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
 			proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+			return res;
+		},
+		async listTools() {
+			return rpc("tools/list", {});
 		},
 		async call(name, args) {
 			const r = await rpc("tools/call", { name, arguments: args }, 120_000);

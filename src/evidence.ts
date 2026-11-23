@@ -3,8 +3,9 @@ import { StringDecoder } from "string_decoder";
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync,
   realpathSync, readdirSync, openSync, closeSync, readSync, unlinkSync, renameSync,
+  accessSync, constants as fsConstants,
 } from "fs";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { createHash } from "crypto";
 import path from "path";
 import {
@@ -19,13 +20,44 @@ import {
 } from "./types.js";
 
 // ── Codex Binary ──────────────────────────────────────────────────
-export function resolveCodexBinary(): string {
-  if (process.env.CODEX_BINARY && existsSync(process.env.CODEX_BINARY)) return process.env.CODEX_BINARY;
-  const p = "/Applications/Codex.app/Contents/Resources/codex";
-  if (existsSync(p)) return p;
+function isExecutableFile(p: string): boolean {
+  try {
+    if (!existsSync(p) || !statSync(p).isFile()) return false;
+    accessSync(p, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveCodexBinary(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  if (env.CODEX_BINARY && existsSync(env.CODEX_BINARY)) return env.CODEX_BINARY;
+  const candidates = [
+    "/Applications/Codex.app/Contents/Resources/codex",
+    path.join(home, ".local", "bin", "codex"),
+    path.join(home, ".codex", "packages", "standalone", "current", "bin", "codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    path.join(home, ".npm-global", "bin", "codex"),
+    path.join(home, ".volta", "bin", "codex"),
+    path.join(home, ".bun", "bin", "codex"),
+  ];
+  for (const c of candidates) {
+    if (isExecutableFile(c)) return c;
+  }
+  const pathEnv = env.PATH ?? "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "codex");
+    if (isExecutableFile(candidate)) return candidate;
+  }
   return "codex";
 }
 export const CODEX_BINARY = resolveCodexBinary();
+export const CODEX_BINARY_REALPATH: string | undefined = (() => {
+  try { return path.isAbsolute(CODEX_BINARY) ? realpathSync(CODEX_BINARY) : undefined; }
+  catch { return undefined; }
+})();
 
 // ── Env ──────────────────────────────────────────────────────────
 export function buildSafeEnv(keys: Set<string>): NodeJS.ProcessEnv {
@@ -34,8 +66,21 @@ export function buildSafeEnv(keys: Set<string>): NodeJS.ProcessEnv {
   e.PATH ||= "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
   return e;
 }
+function prependPathDirs(currentPath: string, dirs: string[]): string {
+  const parts = currentPath.split(path.delimiter).filter(Boolean);
+  const existing = new Set(parts);
+  const additions: string[] = [];
+  for (const d of dirs) {
+    if (d && !existing.has(d)) { existing.add(d); additions.push(d); }
+  }
+  return [...additions, ...parts].join(path.delimiter);
+}
 export function buildCodexEnv(): NodeJS.ProcessEnv {
   const e = buildSafeEnv(SAFE_ENV);
+  const extraDirs: string[] = [];
+  if (path.isAbsolute(CODEX_BINARY)) extraDirs.push(path.dirname(CODEX_BINARY));
+  if (CODEX_BINARY_REALPATH) extraDirs.push(path.dirname(CODEX_BINARY_REALPATH));
+  if (extraDirs.length && e.PATH) e.PATH = prependPathDirs(e.PATH, extraDirs);
   // Mirror proxy env vars: derive missing variants from what's available.
   // Codex CLI reads uppercase for its own API connection (HTTP CONNECT → WSS),
   // Codex network-proxy reads both cases for sandbox child processes.
@@ -419,12 +464,18 @@ export function pidCommand(pid: number): string {
 export function pidLooksLikeCodex(pid: number): boolean {
   const cmd = pidCommand(pid);
   if (!cmd) return false;
-  return cmd.includes(CODEX_BINARY) || cmd.includes("/Codex.app/Contents/Resources/codex") || /(?:^|\s)codex(?:\s|$)/i.test(cmd);
+  return cmd.includes(CODEX_BINARY)
+    || Boolean(CODEX_BINARY_REALPATH && cmd.includes(CODEX_BINARY_REALPATH))
+    || cmd.includes("/Codex.app/Contents/Resources/codex")
+    || /(?:^|\s)codex(?:\s|$)/i.test(cmd);
 }
 export function pidLooksLikeCodexForRun(pid: number, runIdOrRunDir: string): boolean {
   const cmd = pidCommand(pid);
   if (!cmd) return false;
-  const isCodex = cmd.includes(CODEX_BINARY) || cmd.includes("/Codex.app/Contents/Resources/codex") || /(?:^|\s)codex(?:\s|$)/i.test(cmd);
+  const isCodex = cmd.includes(CODEX_BINARY)
+    || Boolean(CODEX_BINARY_REALPATH && cmd.includes(CODEX_BINARY_REALPATH))
+    || cmd.includes("/Codex.app/Contents/Resources/codex")
+    || /(?:^|\s)codex(?:\s|$)/i.test(cmd);
   return isCodex && cmd.includes(runIdOrRunDir);
 }
 export function pidLooksLikeBridgeWorker(pid: number, runId?: string): boolean {
@@ -474,9 +525,19 @@ export function readCapped(p: string, max: number): { text: string; truncated: b
     return { text: readUtf8Prefix(p, r) + TRUNCATED_HEAD_MARKER, truncated: true };
   } catch { return undefined; }
 }
-export function cmdOk(c: string, a: string[] = []) {
-  try { return { ok: true, output: execFileSync(c, a, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 }).trim() }; }
-  catch (e: any) { return { ok: false, error: e?.message || String(e) }; }
+export function cmdOk(c: string, a: string[] = [], opts?: { env?: NodeJS.ProcessEnv; timeout?: number }) {
+  try {
+    const r = spawnSync(c, a, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 1024 * 1024,
+      timeout: opts?.timeout ?? 10_000,
+      ...(opts?.env ? { env: opts.env } : {}),
+    });
+    if (r.error) return { ok: false, error: r.error.message || String(r.error) };
+    if (r.status !== 0) return { ok: false, error: (r.stderr || "").trim() || (r.stdout || "").trim() || `exit ${r.status}` };
+    return { ok: true, output: (r.stdout || "").trim() || (r.stderr || "").trim() };
+  } catch (e: any) { return { ok: false, error: e?.message || String(e) }; }
 }
 export function cleanOldTmpDirs(max = 7 * 24 * 60 * 60 * 1000) {
   try {

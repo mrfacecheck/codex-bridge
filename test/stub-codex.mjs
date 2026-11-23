@@ -31,6 +31,11 @@ if (args.includes("--version")) {
 	process.exit(0);
 }
 
+if (args[0] === "login" && args[1] === "status") {
+	console.log("Logged in using stub");
+	process.exit(0);
+}
+
 // grants path (cx137): codex mcp list --json — control file can inject a
 // server list; default is an empty MCP surface.
 if (args[0] === "mcp" && args[1] === "list") {

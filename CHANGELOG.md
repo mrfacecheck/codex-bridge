@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.3.7
+
+Multi-client MCP ergonomics, shadow `CODEX_HOME` fidelity, and worktree lifecycle fixes (Antigravity, Claude Code, and any standard Stdio MCP client).
+
+### Added
+- **Native MCP server `instructions` & rich Zod parameter descriptions**: Protocol-level guidance for progressive retrieval (`status → summary → diff`), `isolation="worktree"`, `codex_resume`, and context economy — works out of the box across MCP clients without client-specific prompt files.
+- **Auto-discovery of `codex` binary**: `resolveCodexBinary()` now probes `CODEX_BINARY`, `/Applications/Codex.app/...`, `~/.local/bin/codex`, `~/.codex/packages/standalone/current/bin/codex`, Homebrew, npm-global, Volta, Bun, and `PATH`; `buildCodexEnv()` prepends the binary's directory (and realpath dir) so sibling helpers (e.g. `codex-code-mode-host`) resolve even under minimal GUI `PATH`.
+- **`return_view` (`full` | `summary`)** on `codex_exec` and `codex_resume`: lets fast sync/auto completions return the compact summary directly instead of dumping full diffs into context.
+- **`CODEX_BRIDGE_MAX_WAIT_SECONDS`**: Optional server-side wait ceiling (`10..240`) to keep long-poll / sync budgets within strict MCP client timeouts.
+- **`codex_resume` parity**: Added `effort`, `acceptance`, and `non_goals` parameters; inherits parent run `effort` when omitted.
+- **Enhanced `codex_sessions doctor`**: Reports `codex_binary_realpath`, `codex_auth` (`codex login status`), `bridge_home`, `bridge_home_writable`, `active_worktrees`, and `max_wait_seconds`.
+- **`summary` view worktree metadata**: Includes `isolation`, `worktree_path`, and `parent_git_root`.
+
+### Fixed
+- **Shadow `CODEX_HOME` model/provider inheritance & 275× faster zero-grant startup**: `extractSafeCodexDefaults()` preserves allowlisted non-capability keys (`model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`, `service_tier`, `model_provider`) and only the referenced `[model_providers.<name>]` block into shadow `config.toml` while continuing to strip plugins, marketplaces, `notify`, sandbox overrides, and ungranted MCP servers. Zero-grant (`grants_mcp=[]`) runs skip probing the real `~/.codex` MCP list while keeping the fail-closed post-write shadow probe.
+- **Worktree trust & project brief alignment**: `codex_exec` in `isolation="worktree"` now trusts `worktreePath` (not parent repo) in shadow `config.toml`, points `- Git root:` in the project brief at `worktreePath`, uses `buildGitEnv()` for `git worktree add/remove`, and rolls back `runDir` + `worktreePath` on setup/grant failures.
+- **Worktree `codex_resume` continuity**: Resuming a worktree session continues inside the existing worktree (accepting either the repo root or worktree path as `cwd`), preserves parent-checkout escape detection, and fails clearly if the worktree was already cleaned up.
+
+## v2.3.6
+
+- Fixed `grants.ts` `extractServerBlocks()` with a unified char-level TOML string/comment lexer so multi-line `"""` / `'''` strings cannot leak `[` bracket depth across lines.
+- Expanded unit test coverage across `progress`, `evidence`, `statusline`, and `worker` modules.
+
+## v2.3.5
+
+- Added `CODEX_BRIDGE_HOME` environment variable override to redirect durable state (`runs/`, `projects/`, `sessions/`, `wt/`) for sandboxed environments.
+- Added worker MCP capability grants (`grants_mcp`) enforced via a fail-closed shadow `CODEX_HOME` (zero MCP surface by default).
+
 ## v2.3.4
 
 - Context-economy pass on `codex_sessions`: `wait_seconds` ceiling raised 60 → 240 (one long-poll covers up to 4 minutes of a quiet run, cutting model round-trips ~4×), and `action:"list"` now returns compact rows by default (`verbose: true` restores the full field set) — real sessions produced 6.4k-token truncated list dumps.

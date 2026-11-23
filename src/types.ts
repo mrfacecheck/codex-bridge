@@ -202,6 +202,9 @@ export interface ReviewPacketLike {
   };
   fs_sentinel?: unknown;
   warnings?: string[];
+  isolation?: "inplace" | "worktree";
+  worktree_path?: string;
+  parent_git_root?: string;
   resume_attached?: boolean;
   resume_context_verified?: boolean;
   requested_session_id?: string;

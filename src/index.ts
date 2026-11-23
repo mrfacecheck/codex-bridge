@@ -2,14 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn, execFileSync, spawnSync } from "child_process";
 import { connect as tcpConnect } from "net";
-import { existsSync, statSync, readFileSync, mkdirSync, openSync, closeSync, watch as fsWatch } from "fs";
+import { existsSync, statSync, readFileSync, mkdirSync, openSync, closeSync, watch as fsWatch, rmSync, readdirSync, writeFileSync, unlinkSync } from "fs";
 import { randomUUID } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { z } from "zod";
 import { isTerminal, RECENT_RUN_LOOKUP_LIMIT, ACTIVE_SESSION_SCAN_LIMIT, type RunMeta, type ProgressState, type RunHandle, type RunHandleStatus, type Session, type ReviewPacketLike, type TokenUsage } from "./types.js";
 import {
-  CODEX_BINARY, normalizeCwd, resolveExecContext,
+  CODEX_BINARY, CODEX_BINARY_REALPATH, buildCodexEnv, buildGitEnv, normalizeCwd, resolveExecContext,
   checkWriteLockConflict, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun, pidDescendantOf,
 } from "./evidence.js";
 import {
@@ -18,7 +18,7 @@ import {
   pollForCompletion, updateProjectPointer, getRunDir, runDirExists,
   listRuns, cleanOldRuns, requestCancel, markWorkerDeadIfNeeded,
   assertRunId, updateProgress as updateProgressFile,
-  getLatestRunForSession, durableStateStats, RUNS_DIR,
+  getLatestRunForSession, durableStateStats, BASE_DIR, RUNS_DIR,
 } from "./progress.js";
 import { GrantRejection, normalizeGrants, resolveMcpHome } from "./grants.js";
 
@@ -37,6 +37,46 @@ const PKG_VERSION: string = (() => {
 
 const DEFAULT_WAIT_BUDGET = 60;
 const MAX_WAIT_BUDGET = 240;
+const MAX_CLIENT_WAIT_SECONDS = (() => {
+  const raw = Number(process.env.CODEX_BRIDGE_MAX_WAIT_SECONDS);
+  if (Number.isFinite(raw) && raw >= 10 && raw <= MAX_WAIT_BUDGET) return Math.floor(raw);
+  return MAX_WAIT_BUDGET;
+})();
+
+function clampWaitSeconds(requested: number): number {
+  return Math.max(0, Math.min(requested, MAX_CLIENT_WAIT_SECONDS));
+}
+
+function cleanupFailedRunSetup(runDir: string, gitRoot: string | null, worktreePath?: string) {
+  if (worktreePath && gitRoot) {
+    try {
+      spawnSync("git", ["-C", gitRoot, "worktree", "remove", "--force", worktreePath], { encoding: "utf8", env: buildGitEnv() });
+    } catch {}
+    try { rmSync(worktreePath, { recursive: true, force: true }); } catch {}
+  }
+  try { rmSync(runDir, { recursive: true, force: true }); } catch {}
+}
+
+function isBridgeHomeWritable(): boolean {
+  try {
+    mkdirSync(BASE_DIR, { recursive: true, mode: 0o700 });
+    const probe = path.join(BASE_DIR, `.doctor-write-probe.${process.pid}.${Date.now()}`);
+    writeFileSync(probe, "ok\n", { mode: 0o600 });
+    unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function countActiveWorktrees(): number {
+  try {
+    if (!existsSync(WT_DIR)) return 0;
+    return readdirSync(WT_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).length;
+  } catch {
+    return 0;
+  }
+}
 
 function defaultTimeoutFor(sandbox: string, mode: string): number {
   if (sandbox === "read-only") return 300;
@@ -73,7 +113,7 @@ function resolveCodexRunConfig(model?: string, effort?: string) {
   const cfgModel = readCodexConfigKey("model");
   const cfgEffort = readCodexConfigKey("model_reasoning_effort");
   if (cachedCodexVersion === undefined) {
-    const v = cmdOk(CODEX_BINARY, ["--version"]);
+    const v = cmdOk(CODEX_BINARY, ["--version"], { env: buildCodexEnv(), timeout: 10_000 });
     cachedCodexVersion = v.ok ? v.output : undefined;
   }
   return {
@@ -342,7 +382,7 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
     effort_source: meta?.effortSource,
     codex_version: meta?.codexVersion,
     suggested_action: review ? "read_summary" : stale ? "ask_user_whether_to_continue_or_stop" : "continue_polling",
-    next_poll_after_seconds: review ? undefined : stale ? 120 : 60,
+    next_poll_after_seconds: review ? undefined : Math.min(stale ? 120 : 60, MAX_CLIENT_WAIT_SECONDS),
   };
 }
 
@@ -387,6 +427,9 @@ function compactReviewSummary(runId: string, review: ReviewPacketLike, maxChars:
     failure_hint: review.failure_hint, partial_changes: review.partial_changes,
     session_id: review.session_id, session_name: review.session_name,
     duration_ms: review.duration_ms,
+    isolation: review.isolation,
+    worktree_path: review.worktree_path,
+    parent_git_root: review.parent_git_root,
     model: review.model, model_source: review.model_source,
     effort: review.effort, effort_source: review.effort_source,
     codex_version: review.codex_version,
@@ -493,33 +536,49 @@ function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, t
 }
 
 // ── MCP Server ───────────────────────────────────────────────────
-const server = new McpServer({ name: "codex-bridge", version: PKG_VERSION });
+const SERVER_INSTRUCTIONS = [
+  "codex-bridge is a run-scoped MCP evidence layer for delegating execution to OpenAI Codex CLI.",
+  "",
+  "Recommended workflow:",
+  "1. Write tasks: prefer isolation='worktree' so the caller's checkout stays clean and parallel runs are safe. Clean up finished worktrees with codex_sessions(action='cleanup', run_id=...).",
+  "2. Long or multi-file tasks: use execution_mode='async' (detached worker survives disconnects) and poll codex_sessions(action='get', run_id=..., view='status', wait_seconds=60, since_seq=last_seq).",
+  "3. Context economy: use return_view='summary' on sync/auto calls or read view='summary' first after completion; fetch view='diff' or view='output' only on demand.",
+  "4. Follow-ups on the same task: use codex_resume with session_id (inherits worktree, effort, and shadow CODEX_HOME). Start an unrelated task with codex_exec.",
+  "5. Always provide self-contained task specs (Codex has no prior chat context); include acceptance and non_goals for clear verification.",
+].join("\n");
+
+const server = new McpServer(
+  { name: "codex-bridge", version: PKG_VERSION },
+  { instructions: SERVER_INSTRUCTIONS },
+);
 const SB = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const EM = z.enum(["auto", "sync", "async"]);
+const RV = z.enum(["full", "summary"]);
 
-server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, isolated object dir, sensitive content alias detection, smart preview.", {
-  task: z.string().min(1),
-  cwd: z.string(),
-  model: z.string().optional(),
-  sandbox: SB.optional().default("workspace-write"),
-  timeout: z.number().int().min(10).max(7200).optional(),
-  session_name: z.string().optional(),
-  max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
-  allow_non_git: z.boolean().optional().default(false),
-  allow_large_untracked_snapshot: z.boolean().optional().default(false),
-  danger_ack: z.boolean().optional().default(false),
-  execution_mode: EM.optional().default("auto"),
-  wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
-  project_brief: z.boolean().optional().default(true),
-  isolation: z.enum(["inplace", "worktree"]).optional().default("inplace"),
-  base: z.string().optional(),
-  effort: z.string().optional(),
-  acceptance: z.string().optional(),
-  non_goals: z.string().optional(),
-  output_schema: z.string().optional(),
-  grants_mcp: z.array(z.string()).optional(),
+server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive-content filtering, and optional git worktree isolation. Use execution_mode='async' for multi-file/test work, and return_view='summary' for compact sync responses.", {
+  task: z.string().min(1).describe("Self-contained task specification (Codex has no prior conversation context)."),
+  cwd: z.string().describe("Absolute path to the target project/repository directory."),
+  model: z.string().optional().describe("Optional Codex model override (defaults to user's Codex config)."),
+  sandbox: SB.optional().default("workspace-write").describe("Codex sandbox mode: read-only, workspace-write (default), or danger-full-access."),
+  timeout: z.number().int().min(10).max(7200).optional().describe("Hard worker timeout in seconds (defaults: read-only=300, write=900, async=1200)."),
+  session_name: z.string().optional().describe("Optional human-readable label for this run/session."),
+  max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000).describe("Maximum characters in diff_preview."),
+  allow_non_git: z.boolean().optional().default(false).describe("Allow running in a non-git directory (disables diff capture)."),
+  allow_large_untracked_snapshot: z.boolean().optional().default(false).describe("Bypass the 256MB untracked-file safety check."),
+  danger_ack: z.boolean().optional().default(false).describe("Required true when sandbox='danger-full-access'."),
+  execution_mode: EM.optional().default("auto").describe("auto (wait up to wait_budget_seconds then return async handle), sync, or async (return run_id immediately)."),
+  wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET).describe("Seconds to wait in auto mode before returning an async handle (clamped by CODEX_BRIDGE_MAX_WAIT_SECONDS)."),
+  project_brief: z.boolean().optional().default(true).describe("Prepend compact auto-detected project context (package manager, tech stack, main dirs)."),
+  isolation: z.enum(["inplace", "worktree"]).optional().default("inplace").describe("inplace edits cwd directly (serialized by write lock); worktree creates an isolated git worktree under CODEX_BRIDGE_HOME/wt/<run_id>."),
+  base: z.string().optional().describe("Git ref to base the worktree on when isolation='worktree' (default HEAD)."),
+  effort: z.string().optional().describe("Optional reasoning effort override (e.g. low, medium, high, xhigh)."),
+  acceptance: z.string().optional().describe("Explicit acceptance criteria appended to the prompt for Codex to self-verify."),
+  non_goals: z.string().optional().describe("Explicit out-of-scope constraints appended to the prompt."),
+  output_schema: z.string().optional().describe("Optional JSON Schema string enforced via Codex --output-schema."),
+  grants_mcp: z.array(z.string()).optional().describe("Whitelist of MCP server names from ~/.codex/config.toml to expose inside the worker's shadow CODEX_HOME (default empty = zero MCP surface)."),
+  return_view: RV.optional().default("full").describe("Response shape if the run completes within wait_budget_seconds: full (default) or summary (compact diff stats + tail)."),
 }, async (args) => {
-  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema, grants_mcp } = args;
+  const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema, grants_mcp, return_view } = args;
   const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
 
   let cwd: string;
@@ -544,14 +603,17 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   if (useWorktree) {
     worktreePath = path.join(WT_DIR, runId);
     mkdirSync(path.dirname(worktreePath), { recursive: true });
-    const add = spawnSync("git", ["-C", gitRoot as string, "worktree", "add", "--detach", worktreePath, base ?? "HEAD"], { encoding: "utf8" });
-    if (add.status !== 0) return toolError(`worktree add failed: ${(add.stderr || add.stdout || "").trim()}`, { worktree: worktreePath });
+    const add = spawnSync("git", ["-C", gitRoot as string, "worktree", "add", "--detach", worktreePath, base ?? "HEAD"], { encoding: "utf8", env: buildGitEnv() });
+    if (add.status !== 0) {
+      cleanupFailedRunSetup(runDir, null);
+      return toolError(`worktree add failed: ${(add.stderr || add.stdout || "").trim()}`, { worktree: worktreePath });
+    }
     effectiveCwd = worktreePath;
   }
 
   let finalTask = task;
   if (project_brief) {
-    const brief = buildProjectBrief(effectiveCwd, gitRepo ? gitRoot : null);
+    const brief = buildProjectBrief(effectiveCwd, useWorktree ? effectiveCwd : (gitRepo ? gitRoot : null));
     if (brief) finalTask = brief + task;
   }
   if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
@@ -563,8 +625,9 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   // fail-closed — plugin servers and ungranted config are absent by design).
   let mcpHome: string | undefined;
   try {
-    mcpHome = resolveMcpHome(normalizeGrants({ mcp: grants_mcp ?? [] }), runCwd, runDir).codexHome;
+    mcpHome = resolveMcpHome(normalizeGrants({ mcp: grants_mcp ?? [] }), effectiveCwd, runDir).codexHome;
   } catch (e: any) {
+    cleanupFailedRunSetup(runDir, gitRepo ? gitRoot : null, worktreePath);
     const details = e instanceof GrantRejection ? e.toDetails() : undefined;
     return toolError(e?.message ?? String(e), details);
   }
@@ -591,7 +654,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
   const ses: Session = {
     latestRunId: runId, runIds: [runId],
     name: meta.sessionName, status: "running",
-    cwd: runCwd, gitRoot: gitRepo ? gitRoot : undefined, sandbox,
+    cwd: effectiveCwd, gitRoot: gitRepo ? gitRoot : undefined, sandbox,
     startedAt: Date.now(), lastActiveAt: Date.now(), filesChanged: [],
   };
   byRunId.set(runId, ses);
@@ -601,7 +664,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
     return toolJson(buildRunHandle(runId, meta, progress));
   }
 
-  const waitMs = (execution_mode === "sync" ? MAX_WAIT_BUDGET : wait_budget_seconds) * 1000;
+  const waitMs = clampWaitSeconds(execution_mode === "sync" ? MAX_WAIT_BUDGET : wait_budget_seconds) * 1000;
   const packet = await pollForCompletion(runDir, waitMs);
 
   if (packet) {
@@ -613,7 +676,7 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
     ses.diffPath = (p.git_diff as any)?.diff_path;
     ses.tokenUsage = p.token_usage as any;
     if (p.session_id) { ses.sessionId = p.session_id as string; byCodexId.set(ses.sessionId, ses); }
-    return toolJson(packet);
+    return toolJson(return_view === "summary" ? compactReviewSummary(runId, packet as ReviewPacketLike, 20000) : packet);
   }
 
   const progress = markWorkerDeadIfNeeded(runDir);
@@ -622,38 +685,63 @@ server.tool("codex_exec", "Start Codex session. Run-scoped diff from repo root, 
     const p = failPacket as Record<string, unknown>;
     ses.status = (p.status as Session["status"]) || "failed";
     ses.lastActiveAt = Date.now();
-    return toolJson(failPacket);
+    return toolJson(return_view === "summary" ? compactReviewSummary(runId, failPacket as ReviewPacketLike, 20000) : failPacket);
   }
 
   return toolJson(buildRunHandle(runId, meta, progress));
 });
 
-server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects sensitive content aliases, run-scoped diff from repo root.", {
-  session_id: z.string().min(1),
-  task: z.string().min(1),
-  cwd: z.string().optional(),
-  sandbox: SB.optional(),
-  model: z.string().optional(),
-  timeout: z.number().int().min(10).max(7200).optional(),
-  max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000),
-  allow_non_git: z.boolean().optional().default(false),
-  allow_large_untracked_snapshot: z.boolean().optional().default(false),
-  danger_ack: z.boolean().optional().default(false),
-  execution_mode: EM.optional().default("auto"),
-  wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET),
-  project_brief: z.boolean().optional().default(true),
+server.tool("codex_resume", "Resume an existing Codex session for follow-up fixes or iterations. Preserves thread_id verification, worktree isolation, effort, and shadow CODEX_HOME.", {
+  session_id: z.string().min(1).describe("Codex session_id (thread_id) from a prior codex_exec run."),
+  task: z.string().min(1).describe("Follow-up instructions for the existing Codex session."),
+  cwd: z.string().optional().describe("Optional working directory (must match the original session cwd or parent repo for worktree runs)."),
+  sandbox: SB.optional().describe("Cannot override original session sandbox; omit unless matching."),
+  model: z.string().optional().describe("Optional model override for this resumed turn."),
+  effort: z.string().optional().describe("Optional reasoning effort override (inherits parent run effort if omitted)."),
+  timeout: z.number().int().min(10).max(7200).optional().describe("Hard worker timeout in seconds."),
+  max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000).describe("Maximum characters in diff_preview."),
+  allow_non_git: z.boolean().optional().default(false).describe("Allow running in a non-git directory."),
+  allow_large_untracked_snapshot: z.boolean().optional().default(false).describe("Bypass the 256MB untracked-file safety check."),
+  danger_ack: z.boolean().optional().default(false).describe("Required true when resuming a danger-full-access session."),
+  execution_mode: EM.optional().default("auto").describe("auto, sync, or async."),
+  wait_budget_seconds: z.number().int().min(0).max(MAX_WAIT_BUDGET).optional().default(DEFAULT_WAIT_BUDGET).describe("Seconds to wait in auto mode before returning an async handle."),
+  project_brief: z.boolean().optional().default(true).describe("Prepend compact auto-detected project context."),
+  acceptance: z.string().optional().describe("Optional acceptance criteria appended to the follow-up prompt."),
+  non_goals: z.string().optional().describe("Optional out-of-scope constraints appended to the follow-up prompt."),
+  return_view: RV.optional().default("full").describe("Response shape if the resumed run completes within wait_budget_seconds: full (default) or summary."),
 }, async (args) => {
-  const { session_id, task, cwd: cwdArg, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief } = args;
+  const { session_id, task, cwd: cwdArg, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, acceptance, non_goals, return_view } = args;
 
   const ex = lookupWithDurable(session_id);
   const rsid = ex?.sessionId || session_id;
   if (byRunId.has(session_id) && !ex?.sessionId) return toolError("Cannot resume by run_id. Pass Codex session_id.", { run_id: session_id });
 
-  if (ex && cwdArg) { try { if (normalizeCwd(cwdArg) !== ex.cwd) return toolError("codex_resume cannot override cwd (Codex CLI resume has no -C). Use original session cwd.", { requested: cwdArg, session_cwd: ex.cwd, session_id }); } catch (e: any) { return toolError(e.message); } }
+  // cx141 ruling §1: a resumed run must reuse the parent run's shadow
+  // CODEX_HOME — the session file lives inside it. Falling back to the real
+  // home would lose the session AND re-widen the MCP surface; fail closed.
+  const parentRunId = ex?.latestRunId;
+  const parentMeta = parentRunId && runDirExists(parentRunId) ? readRunMeta(getRunDir(parentRunId)) : null;
+  const isParentWorktree = Boolean(parentMeta?.isolation === "worktree" && parentMeta.worktreePath);
+
+  if (isParentWorktree && !existsSync(parentMeta!.worktreePath!)) {
+    return toolError("Cannot resume: worktree was already cleaned up.", { session_id, worktree_path: parentMeta!.worktreePath });
+  }
+
+  if (ex && cwdArg) {
+    try {
+      const requestedCwd = normalizeCwd(cwdArg);
+      const allowedCwds = new Set<string>([ex.cwd]);
+      if (parentMeta?.worktreePath && existsSync(parentMeta.worktreePath)) allowedCwds.add(normalizeCwd(parentMeta.worktreePath));
+      if (parentMeta?.parentGitRoot && existsSync(parentMeta.parentGitRoot)) allowedCwds.add(normalizeCwd(parentMeta.parentGitRoot));
+      if (!allowedCwds.has(requestedCwd)) {
+        return toolError("codex_resume cannot override cwd (Codex CLI resume has no -C). Use original session cwd.", { requested: cwdArg, session_cwd: ex.cwd, session_id });
+      }
+    } catch (e: any) { return toolError(e.message); }
+  }
   if (ex && args.sandbox && args.sandbox !== ex.sandbox) return toolError("codex_resume cannot override sandbox (Codex CLI resume has no -s). Use original session sandbox.", { requested: args.sandbox, session_sandbox: ex.sandbox, session_id });
   if (!ex && args.sandbox) return toolError("codex_resume cannot enforce sandbox for an unknown external session. Omit sandbox or resume a bridge-created session.", { requested_sandbox: args.sandbox, assumed_sandbox: "workspace-write", session_id });
 
-  const rawCwd = ex?.cwd || cwdArg;
+  const rawCwd = isParentWorktree ? parentMeta!.worktreePath! : (ex?.cwd || cwdArg);
   if (!rawCwd) return toolError("Unknown session. Provide cwd for evidence capture.", { session_id });
   let cwd: string; try { cwd = normalizeCwd(rawCwd); } catch (e: any) { return toolError(e.message); }
 
@@ -662,6 +750,10 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
 
   const { runCwd, gitRoot, gitRepo } = resolveExecContext(cwd);
   if (!gitRepo && !allow_non_git) return toolError("Not a Git repo. Set allow_non_git=true.", { cwd: runCwd });
+
+  if (!parentMeta?.mcpHome) {
+    return toolError("cannot resume: no parent run with a shadow CODEX_HOME to inherit (pre-grants or external session). Fail closed — start a fresh codex_exec.", { session_id, parent_run_id: parentRunId ?? null });
+  }
 
   if (effectiveSandbox !== "read-only") {
     const conflict = checkWriteLockConflict(gitRepo ? gitRoot : runCwd);
@@ -680,20 +772,18 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
 
   let finalTask = task;
   if (project_brief) {
-    const brief = buildProjectBrief(runCwd, gitRepo ? gitRoot : null);
+    const brief = buildProjectBrief(runCwd, isParentWorktree ? runCwd : (gitRepo ? gitRoot : null));
     if (brief) finalTask = brief + task;
   }
-
-  // cx141 ruling §1: a resumed run must reuse the parent run's shadow
-  // CODEX_HOME — the session file lives inside it. Falling back to the real
-  // home would lose the session AND re-widen the MCP surface; fail closed.
-  const parentRunId = ex?.latestRunId;
-  const parentMeta = parentRunId && runDirExists(parentRunId) ? readRunMeta(getRunDir(parentRunId)) : null;
-  if (!parentMeta?.mcpHome) {
-    return toolError("cannot resume: no parent run with a shadow CODEX_HOME to inherit (pre-grants or external session). Fail closed — start a fresh codex_exec.", { session_id, parent_run_id: parentRunId ?? null });
+  if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
+  if (non_goals) finalTask += `\n\nNon-goals (do NOT do these):\n${non_goals}`;
+  if (isParentWorktree && parentMeta.parentGitRoot) {
+    finalTask += `\n\nConstraints: your ONLY writable directory is ${parentMeta.worktreePath}. The checkout at ${parentMeta.parentGitRoot} is read-only context — do not create, modify, or delete files there or anywhere outside your worktree. Do not commit, do not push.`;
   }
+
   const mcpHome = parentMeta.mcpHome;
   const inheritedGrants = parentMeta.grants ?? { mcp: [] };
+  const effectiveEffort = args.effort ?? parentMeta.effort;
 
   const meta: RunMeta = {
     runId, cwd: runCwd, gitRoot: gitRepo ? gitRoot : null, sandbox: effectiveSandbox,
@@ -703,15 +793,19 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
     createdAt: new Date().toISOString(), resumeSessionId: rsid,
     resumeContextVerified,
+    isolation: parentMeta.isolation,
+    worktreePath: isParentWorktree ? parentMeta.worktreePath : undefined,
+    parentGitRoot: isParentWorktree ? parentMeta.parentGitRoot : undefined,
+    effort: effectiveEffort,
     mcpHome, grants: inheritedGrants,
-    ...resolveCodexRunConfig(args.model, undefined),
+    ...resolveCodexRunConfig(args.model, effectiveEffort),
   };
   writeRunMeta(runDir, meta);
 
   const w = startWorker(runDir, meta);
   if (!w.ok) return toolError(w.error, { run_id: runId });
 
-  if (gitRepo) updateProjectPointer(gitRoot, runId);
+  if (gitRepo) updateProjectPointer(isParentWorktree && parentMeta.parentGitRoot ? parentMeta.parentGitRoot : gitRoot, runId);
 
   const ses: Session = ex || {
     latestRunId: runId, runIds: [], sessionId: rsid,
@@ -731,7 +825,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     return toolJson(buildRunHandle(runId, meta, progress));
   }
 
-  const waitMs = (execution_mode === "sync" ? MAX_WAIT_BUDGET : wait_budget_seconds) * 1000;
+  const waitMs = clampWaitSeconds(execution_mode === "sync" ? MAX_WAIT_BUDGET : wait_budget_seconds) * 1000;
   const packet = await pollForCompletion(runDir, waitMs);
 
   if (packet) {
@@ -745,7 +839,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     const sessionId = p.session_id as string | undefined;
     if (sessionId && attached) { ses.sessionId = sessionId; byCodexId.set(sessionId, ses); }
     if (!attached && !ex) byRunId.delete(runId);
-    return toolJson(packet);
+    return toolJson(return_view === "summary" ? compactReviewSummary(runId, packet as ReviewPacketLike, 20000) : packet);
   }
 
   const progress = markWorkerDeadIfNeeded(runDir);
@@ -755,7 +849,7 @@ server.tool("codex_resume", "Resume Codex session. Verifies thread_id, detects s
     ses.status = (p.status as Session["status"]) || "failed";
     ses.lastActiveAt = Date.now();
     if (!ex && p.resume_attached === false) byRunId.delete(runId);
-    return toolJson(failPacket);
+    return toolJson(return_view === "summary" ? compactReviewSummary(runId, failPacket as ReviewPacketLike, 20000) : failPacket);
   }
 
   return toolJson(buildRunHandle(runId, meta, progress));
@@ -765,27 +859,39 @@ const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 
 const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
 
-server.tool("codex_sessions", "List, inspect, stop, or diagnose. Poll view='status' with wait_seconds (up to 240) to long-poll instead of tight looping.", {
-  action: z.enum(["list", "get", "stop", "doctor", "cleanup"]),
-  session_id: z.string().optional(),
-  run_id: RunIdSchema,
-  view: VIEW.optional().default("status"),
-  max_chars: z.number().int().min(1000).max(200000).optional().default(20000),
-  wait_seconds: z.number().int().min(0).max(240).optional().default(0),
-  verbose: z.boolean().optional().default(false),
-  since_seq: z.number().int().min(0).optional(),
+server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run doctor diagnostics. Poll view='status' with wait_seconds (long-poll) and read view='summary' before diff/review.", {
+  action: z.enum(["list", "get", "stop", "doctor", "cleanup"]).describe("list recent runs, get run status/summary/diff/output/review, stop an active run, doctor environment check, or cleanup a worktree."),
+  session_id: z.string().optional().describe("Codex session_id (alternative to run_id for get/stop)."),
+  run_id: RunIdSchema.describe("UUID of a codex-bridge run (required for cleanup; preferred for get/stop)."),
+  view: VIEW.optional().default("status").describe("For action='get': status (lightweight poll), summary (compact files/warnings/tail), diff, output, or review."),
+  max_chars: z.number().int().min(1000).max(200000).optional().default(20000).describe("Character cap for diff/output/review views."),
+  wait_seconds: z.number().int().min(0).max(240).optional().default(0).describe("Event-driven long-poll duration in seconds for view='status' (clamped by CODEX_BRIDGE_MAX_WAIT_SECONDS)."),
+  verbose: z.boolean().optional().default(false).describe("Include git_root, sandbox, model, and progress message in action='list'."),
+  since_seq: z.number().int().min(0).optional().describe("Return incremental progress_events with seq > since_seq."),
 }, async (args) => {
   const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, verbose, since_seq } = args;
 
   if (action === "doctor") {
     const stats = durableStateStats();
     const connectivity = await tcpProbe("api.openai.com", 443, 5000);
+    const codexEnv = buildCodexEnv();
+    const gitEnv = buildGitEnv();
+    const codexVersion = cmdOk(CODEX_BINARY, ["--version"], { env: codexEnv, timeout: 10_000 });
+    const codexAuth = cmdOk(CODEX_BINARY, ["login", "status"], { env: codexEnv, timeout: 10_000 });
+    const gitVersion = cmdOk("git", ["--version"], { env: gitEnv, timeout: 10_000 });
     return toolJson({
-      bridge_version: PKG_VERSION, codex_binary: CODEX_BINARY,
-      codex_version: cmdOk(CODEX_BINARY, ["--version"]),
-      git_version: cmdOk("git", ["--version"]),
+      bridge_version: PKG_VERSION,
+      codex_binary: CODEX_BINARY,
+      ...(CODEX_BINARY_REALPATH && CODEX_BINARY_REALPATH !== CODEX_BINARY ? { codex_binary_realpath: CODEX_BINARY_REALPATH } : {}),
+      codex_version: codexVersion,
+      codex_auth: codexAuth,
+      git_version: gitVersion,
       node: process.version, platform: process.platform, arch: process.arch,
-      env: { has_HOME: Boolean(process.env.HOME), has_CODEX_HOME: Boolean(process.env.CODEX_HOME), has_OPENAI_API_KEY: Boolean(process.env.OPENAI_API_KEY), has_proxy: Boolean(process.env.HTTPS_PROXY || process.env.HTTP_PROXY) },
+      bridge_home: BASE_DIR,
+      bridge_home_writable: isBridgeHomeWritable(),
+      active_worktrees: countActiveWorktrees(),
+      max_wait_seconds: MAX_CLIENT_WAIT_SECONDS,
+      env: { has_HOME: Boolean(process.env.HOME), has_CODEX_HOME: Boolean(process.env.CODEX_HOME), has_CODEX_BRIDGE_HOME: Boolean(process.env.CODEX_BRIDGE_HOME), has_OPENAI_API_KEY: Boolean(process.env.OPENAI_API_KEY), has_proxy: Boolean(process.env.HTTPS_PROXY || process.env.HTTP_PROXY) },
       network: { ...connectivity, probe: "direct_tcp", host: "api.openai.com", port: 443, note: "Direct TCP probe. Proxy/VPN/PAC environments may differ from actual Codex connectivity." },
       durable_state: { run_count: stats.runCount, session_pointers: stats.sessionPointerCount, disk_bytes: stats.totalBytes, disk_mb: Math.round(stats.totalBytes / 1024 / 1024 * 10) / 10, oldest_run: stats.oldestRun, cleanup_policy: "7 days, triggered on startup and hourly during use" },
     });
@@ -848,9 +954,14 @@ server.tool("codex_sessions", "List, inspect, stop, or diagnose. Poll view='stat
     const rd = getRunDir(rid);
     const meta = readRunMeta(rd);
     if (!meta?.worktreePath) return toolJson({ cleaned: false, reason: "Run did not use isolation=worktree." });
-    if (!existsSync(meta.worktreePath)) return toolJson({ cleaned: true, worktree: meta.worktreePath, note: "Worktree already gone." });
     const base = meta.parentGitRoot ?? meta.gitRoot;
-    const r = spawnSync("git", ["-C", base as string, "worktree", "remove", "--force", meta.worktreePath], { encoding: "utf8" });
+    if (!existsSync(meta.worktreePath)) {
+      if (base && existsSync(base)) {
+        try { spawnSync("git", ["-C", base, "worktree", "prune"], { encoding: "utf8", env: buildGitEnv() }); } catch {}
+      }
+      return toolJson({ cleaned: true, worktree: meta.worktreePath, note: "Worktree already gone." });
+    }
+    const r = spawnSync("git", ["-C", base as string, "worktree", "remove", "--force", meta.worktreePath], { encoding: "utf8", env: buildGitEnv() });
     return toolJson({ cleaned: r.status === 0, worktree: meta.worktreePath, stderr: (r.stderr || "").trim() || undefined });
   }
 
@@ -883,7 +994,8 @@ async function getByRunId(
   if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
 
   // Long-poll: wait for progress change or review completion
-  if (waitSeconds > 0) await waitForProgressOrReview(runDir, sinceSeq, waitSeconds * 1000);
+  const effectiveWait = clampWaitSeconds(waitSeconds);
+  if (effectiveWait > 0) await waitForProgressOrReview(runDir, sinceSeq, effectiveWait * 1000);
 
   markWorkerDeadIfNeeded(runDir);
   const meta = readRunMeta(runDir);

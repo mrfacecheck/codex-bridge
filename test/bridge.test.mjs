@@ -1,18 +1,21 @@
 /** Deterministic offline regression suite for codex-bridge via stub-codex. */
 import { test, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, unlinkSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, unlinkSync, mkdtempSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnBridge, makeRepo, git, waitFor, setStubControl } from "./helpers.mjs";
 
 let bridge;
+let bridgeHome;
+let initResult;
 let repo;
 
 before(async () => {
 	repo = makeRepo();
-	bridge = spawnBridge();
-	await bridge.init();
+	bridgeHome = mkdtempSync(join(tmpdir(), "cb-bridgehome-"));
+	bridge = spawnBridge({ CODEX_BRIDGE_HOME: bridgeHome });
+	initResult = await bridge.init();
 });
 
 beforeEach(() => setStubControl({ mode: "success", write: "OUT.txt::hello-from-stub\n" }));
@@ -21,12 +24,29 @@ after(() => {
 	bridge.close();
 	setStubControl({});
 	rmSync(repo, { recursive: true, force: true });
+	rmSync(bridgeHome, { recursive: true, force: true });
 	try { unlinkSync(join(tmpdir(), "cb-stub-codex-control.json")); } catch {}
+});
+
+test("initialize exposes client-agnostic server instructions and described tool schemas", async () => {
+	assert.equal(typeof initResult?.instructions, "string");
+	assert.match(initResult.instructions, /worktree/i);
+	assert.match(initResult.instructions, /summary/i);
+	const list = await bridge.listTools();
+	const execTool = list.tools.find((t) => t.name === "codex_exec");
+	const resumeTool = list.tools.find((t) => t.name === "codex_resume");
+	assert.ok(execTool?.inputSchema?.properties?.return_view?.description, "codex_exec.return_view documented");
+	assert.ok(resumeTool?.inputSchema?.properties?.effort?.description, "codex_resume.effort documented");
 });
 
 test("doctor reports healthy with stub codex", async () => {
 	const r = await bridge.call("codex_sessions", { action: "doctor" });
 	assert.match(JSON.stringify(r), /stub|0\.166/i);
+	assert.equal(r.codex_auth?.ok, true);
+	assert.equal(r.bridge_home, bridgeHome);
+	assert.equal(r.bridge_home_writable, true);
+	assert.equal(typeof r.active_worktrees, "number");
+	assert.equal(r.max_wait_seconds, 240);
 });
 
 test("codex_exec worktree: completes, isolates changes, parent stays clean", async () => {
@@ -188,7 +208,7 @@ test("cleanup removes worktree", async () => {
 test("model resolution: config.toml, flag override, and honest unknown", async () => {
 	const cfgHome = mkdtempSync(join(tmpdir(), "cb-codexhome-"));
 	writeFileSync(join(cfgHome, "config.toml"), 'model = "fixture-gpt"\nmodel_reasoning_effort = "low"\n');
-	const b = spawnBridge({ CODEX_HOME: cfgHome });
+	const b = spawnBridge({ CODEX_HOME: cfgHome, CODEX_BRIDGE_HOME: bridgeHome });
 	await b.init();
 	try {
 		setStubControl({ mode: "success" });
@@ -218,7 +238,7 @@ test("model resolution: config.toml, flag override, and honest unknown", async (
 	}
 
 	const emptyHome = mkdtempSync(join(tmpdir(), "cb-codexhome-empty-"));
-	const b2 = spawnBridge({ CODEX_HOME: emptyHome });
+	const b2 = spawnBridge({ CODEX_HOME: emptyHome, CODEX_BRIDGE_HOME: bridgeHome });
 	await b2.init();
 	try {
 		setStubControl({ mode: "success" });
@@ -234,4 +254,108 @@ test("model resolution: config.toml, flag override, and honest unknown", async (
 		rmSync(emptyHome, { recursive: true, force: true });
 	}
 	rmSync(join(repo, "OUT.txt"), { force: true });
+});
+
+test("worktree exec trusts worktree in shadow config, points brief at worktree, and supports return_view=summary", async () => {
+	const r = await bridge.call("codex_exec", {
+		task: "write summary test",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 30,
+		timeout: 60,
+		return_view: "summary",
+	});
+	assert.equal(r.status, "completed", JSON.stringify(r).slice(0, 600));
+	assert.equal(r.isolation, "worktree");
+	assert.ok(r.worktree_path, "summary view exposes worktree_path");
+	assert.equal("diff_preview" in (r.git_diff ?? {}), false, "summary view omits full diff_preview");
+	assert.ok(r.next_action, "summary view exposes next_action");
+
+	const meta = JSON.parse(readFileSync(join(bridgeHome, "runs", r.run_id, "run.json"), "utf8"));
+	assert.ok(meta.task.includes(`- Git root: ${r.worktree_path}`), "project brief points at worktree, not parent checkout");
+	const shadowCfg = readFileSync(join(meta.mcpHome, "config.toml"), "utf8");
+	assert.ok(shadowCfg.includes(`[projects.${JSON.stringify(r.worktree_path)}]`), "shadow config trusts worktree path");
+
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
+	assert.equal(existsSync(r.worktree_path), false, "cleanup removed worktree");
+});
+
+test("worktree exec rolls back runDir and worktree on grant rejection", async () => {
+	const runsBefore = existsSync(join(bridgeHome, "runs")) ? readdirSync(join(bridgeHome, "runs")).length : 0;
+	const wtBefore = existsSync(join(bridgeHome, "wt")) ? readdirSync(join(bridgeHome, "wt")).length : 0;
+	const r = await bridge.call("codex_exec", {
+		task: "should be rejected",
+		cwd: repo,
+		isolation: "worktree",
+		grants_mcp: ["computer-use"],
+		execution_mode: "async",
+	});
+	assert.match(JSON.stringify(r), /grant_rejected|forbidden/i);
+	const runsAfter = existsSync(join(bridgeHome, "runs")) ? readdirSync(join(bridgeHome, "runs")).length : 0;
+	const wtAfter = existsSync(join(bridgeHome, "wt")) ? readdirSync(join(bridgeHome, "wt")).length : 0;
+	assert.equal(runsAfter, runsBefore, "rejected exec leaves no orphan runDir");
+	assert.equal(wtAfter, wtBefore, "rejected exec leaves no orphan worktree");
+});
+
+test("worktree resume stays inside worktree, preserves effort, and fails cleanly after cleanup", async () => {
+	setStubControl({ mode: "success", write: "STEP1.txt::one\n" });
+	const r1 = await bridge.call("codex_exec", {
+		task: "step 1",
+		cwd: repo,
+		isolation: "worktree",
+		effort: "medium",
+		execution_mode: "auto",
+		wait_budget_seconds: 30,
+		timeout: 60,
+	});
+	assert.equal(r1.status, "completed");
+	assert.ok(r1.session_id && r1.worktree_path);
+
+	setStubControl({ mode: "success", write: "STEP2.txt::two\n" });
+	const r2 = await bridge.call("codex_resume", {
+		session_id: r1.session_id,
+		task: "step 2",
+		cwd: repo,
+		effort: "high",
+		execution_mode: "auto",
+		wait_budget_seconds: 30,
+		timeout: 60,
+		return_view: "summary",
+	});
+	assert.equal(r2.status, "completed", JSON.stringify(r2).slice(0, 600));
+	assert.equal(r2.worktree_path, r1.worktree_path);
+	assert.equal(r2.effort, "high");
+	assert.equal(r2.effort_source, "flag");
+	assert.ok(existsSync(join(r1.worktree_path, "STEP2.txt")), "resume wrote inside worktree");
+	assert.equal(git(repo, "status", "--porcelain").trim(), "", "parent checkout stays untouched during worktree resume");
+
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r2.run_id });
+	const r3 = await bridge.call("codex_resume", {
+		session_id: r1.session_id,
+		task: "step 3 after cleanup",
+		execution_mode: "auto",
+	});
+	assert.match(JSON.stringify(r3), /worktree was already cleaned up/i);
+});
+
+test("CODEX_BRIDGE_MAX_WAIT_SECONDS caps doctor max_wait_seconds and poll suggestions", async () => {
+	const b = spawnBridge({ CODEX_BRIDGE_HOME: bridgeHome, CODEX_BRIDGE_MAX_WAIT_SECONDS: "45" });
+	await b.init();
+	try {
+		const doc = await b.call("codex_sessions", { action: "doctor" });
+		assert.equal(doc.max_wait_seconds, 45);
+		setStubControl({ mode: "hang" });
+		const run = await b.call("codex_exec", { task: "hang briefly", cwd: repo, isolation: "worktree", execution_mode: "async" });
+		const st = await b.call("codex_sessions", { action: "get", run_id: run.run_id, view: "status" });
+		assert.ok(st.next_poll_after_seconds <= 45, `expected <=45, got ${st.next_poll_after_seconds}`);
+		await b.call("codex_sessions", { action: "stop", run_id: run.run_id });
+		await waitFor(async () => {
+			const s = await b.call("codex_sessions", { action: "get", run_id: run.run_id, view: "status" });
+			return s.review_ready;
+		});
+		await b.call("codex_sessions", { action: "cleanup", run_id: run.run_id });
+	} finally {
+		b.close();
+	}
 });

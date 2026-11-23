@@ -12,7 +12,7 @@ const BASE_DIR = process.env.CODEX_BRIDGE_HOME ?? path.join(homedir(), ".codex-b
 const RUNS_DIR = path.join(BASE_DIR, "runs");
 const PROJECTS_DIR = path.join(BASE_DIR, "projects");
 
-export { RUNS_DIR, PROJECTS_DIR };
+export { BASE_DIR, RUNS_DIR, PROJECTS_DIR };
 
 // ── Filesystem helpers (permissions hardened) ────────────────────
 function ensureDir(d: string) {

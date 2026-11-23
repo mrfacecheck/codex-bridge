@@ -1,12 +1,12 @@
 /** Unit tests for src/evidence.ts pure/fs-local helpers. All fs side effects live in mkdtemp dirs. */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, statSync, realpathSync, renameSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, statSync, realpathSync, renameSync, readFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
-	buildSafeEnv, buildGitEnv, normalizeCwd, isGitRepo, resolveExecContext, lockKey, pidAlive,
+	resolveCodexBinary, buildSafeEnv, buildCodexEnv, buildGitEnv, cmdOk, normalizeCwd, isGitRepo, resolveExecContext, lockKey, pidAlive,
 	readLock, writeAtomic, lockAlive, acquireWriteLock, checkWriteLockConflict,
 	getWorktreeStatus, getUntrackedStats,
 } from "../dist/evidence.js";
@@ -145,4 +145,47 @@ test("getUntrackedStats counts bytes, sorts largest, stops early at limit", () =
 	assert.equal(st.stoppedEarly, false);
 	assert.equal(getUntrackedStats(repo, 5).stoppedEarly, true);
 	assert.throws(() => getUntrackedStats(tmp()), /Unable to enumerate untracked files/);
+});
+
+test("resolveCodexBinary prefers env override, then home ~/.local/bin, then PATH", () => {
+	const fakeHome = tmp("cb-ev-home-");
+	const override = join(fakeHome, "custom-codex");
+	writeFileSync(override, "#!/bin/sh\n"); chmodSync(override, 0o755);
+	assert.equal(resolveCodexBinary({ CODEX_BINARY: override }, fakeHome), override);
+
+	const localBin = join(fakeHome, ".local", "bin");
+	mkdirSync(localBin, { recursive: true });
+	const localCodex = join(localBin, "codex");
+	writeFileSync(localCodex, "#!/bin/sh\n"); chmodSync(localCodex, 0o755);
+	// Only assert ~/.local/bin resolution when /Applications/Codex.app is absent
+	if (!existsSync("/Applications/Codex.app/Contents/Resources/codex")) {
+		assert.equal(resolveCodexBinary({ PATH: "" }, fakeHome), localCodex);
+	}
+
+	const pathDir = tmp("cb-ev-path-");
+	const pathCodex = join(pathDir, "codex");
+	writeFileSync(pathCodex, "#!/bin/sh\n"); chmodSync(pathCodex, 0o755);
+	const emptyHome = tmp("cb-ev-emptyhome-");
+	if (!existsSync("/Applications/Codex.app/Contents/Resources/codex")
+		&& !existsSync("/opt/homebrew/bin/codex")
+		&& !existsSync("/usr/local/bin/codex")) {
+		assert.equal(resolveCodexBinary({ PATH: pathDir }, emptyHome), pathCodex);
+	}
+});
+
+test("cmdOk respects custom env, falls back to stderr on exit 0, and returns ok:false for missing command", () => {
+	const ok = cmdOk(process.execPath, ["-e", "console.log(process.env.CB_CMD_OK)"], { env: { ...process.env, CB_CMD_OK: "yes" } });
+	assert.equal(ok.ok, true);
+	assert.equal(ok.output, "yes");
+	const errOut = cmdOk(process.execPath, ["-e", "console.error('logged-in-stderr')"]);
+	assert.equal(errOut.ok, true);
+	assert.equal(errOut.output, "logged-in-stderr");
+	const bad = cmdOk("/nonexistent/codex-bridge-test-bin", ["--version"]);
+	assert.equal(bad.ok, false);
+});
+
+test("buildCodexEnv always includes a non-empty PATH", () => {
+	const env = buildCodexEnv();
+	assert.equal(typeof env.PATH, "string");
+	assert.ok(env.PATH.length > 0);
 });

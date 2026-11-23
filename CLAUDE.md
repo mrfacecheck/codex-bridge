@@ -1,16 +1,17 @@
 # codex-bridge
 
-Claude 与 Codex 之间的 MCP 证据层。Claude 出方案做审查，Codex 写代码，codex-bridge 捕获文件系统真实变更。
+MCP 客户端（Antigravity / Claude Code 等）与 Codex 之间的 MCP 证据层。上层智能体出方案做审查，Codex 写代码，codex-bridge 捕获文件系统真实变更。
 
 ## 调用规范
 
 1. **task**: 自包含的详细规范。Codex 不知道之前的对话，prompt 必须完整。建议配 `acceptance`（验收标准，worker 完成前自查）和 `non_goals`（明确不做的事）
 2. **cwd**: 项目根目录绝对路径
-3. **model / effort**: 默认省略让 Codex CLI 跟随最新默认。编排路由场景可显式指定（如 `model: "gpt-6.1-sol", effort: "xhigh"`）
+3. **model / effort**: 默认省略让 Codex CLI 跟随 `~/.codex/config.toml` 默认（影子 `CODEX_HOME` 会安全继承 `model` / `model_reasoning_effort` / `service_tier` / `model_provider` 及对应 `[model_providers.<name>]`）。编排路由场景可显式指定（如 `model: "gpt-6.2-sol", effort: "xhigh"`）
 4. **sandbox**: 默认 "workspace-write"，除非任务明确只需要读
-5. **isolation**: 默认 "inplace"（直接改工作树，同 repo 写锁串行）。"worktree" 把运行放进 `~/.codex-bridge/wt/<run_id>` 的隔离 worktree——**不碰调用方工作树、同 repo 可并行、diff 天然只含本次变更**；编排派单场景优先用它，完成后 `codex_sessions cleanup` 回收
-6. **同一任务的修复/迭代**: 用 `codex_resume`（保持上下文），不要新建 session
+5. **isolation**: 默认 "inplace"（直接改工作树，同 repo 写锁串行）。"worktree" 把运行放进 `<CODEX_BRIDGE_HOME>/wt/<run_id>` 的隔离 worktree——**不碰调用方工作树、同 repo 可并行、diff 天然只含本次变更**；编排派单场景优先用它，完成后 `codex_sessions cleanup` 回收
+6. **同一任务的修复/迭代**: 用 `codex_resume`（保持上下文、自动继承 worktree、`effort` 与影子 `CODEX_HOME`），不要新建 session
 7. **不相关的新任务**: 用 `codex_exec` 新建 session
+8. **return_view**: 在 `auto`/`sync` 模式下可传 `return_view: "summary"`，快任务完成时直接返回紧凑摘要，避免把完整 diff 灌入上下文
 
 ## 默认执行策略
 
@@ -137,5 +138,5 @@ npm install -g .                                                              # 
 
 - **GitHub：** https://github.com/mrfacecheck/codex-bridge
 - **npm：** https://www.npmjs.com/package/@codex-bridge/core
-- **版本：** 2.2.7
+- **版本：** 2.3.7
 - **许可证：** MIT

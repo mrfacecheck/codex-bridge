@@ -4,24 +4,29 @@
 
 不是 Codex 包装器。不是聊天桥接。不是只读审查插件。不是多 agent 终端。
 
-codex-bridge 是一个**证据层**：Codex 执行，Claude 审查，交接基于 run-scoped 文件系统 diff。
+codex-bridge 是一个**证据层**：Codex 执行，上层 MCP 智能体（Antigravity、Claude Code、Cursor 等）规划与审查，交接基于 run-scoped 文件系统 diff。
 
 ```
-Claude Code ──[MCP]──▶ codex-bridge ──▶ Codex CLI
-                            │
-                      run-scoped git diff
-                      敏感文件过滤
-                      渐进取证
+MCP 客户端 (Antigravity / Claude Code / ...) ──[MCP]──▶ codex-bridge ──▶ Codex CLI
+                                                              │
+                                                        run-scoped git diff
+                                                        worktree 隔离
+                                                        零 MCP 影子主目录
+                                                        渐进取证
 ```
 
 ## 快速开始
 
+推荐直接从 GitHub 安装或本地构建（npm registry 仍停在 2.2.7）：
+
 ```bash
-npm install -g @codex-bridge/core
-claude mcp add codex-bridge -- npx codex-bridge
+npm install -g github:mrfacecheck/codex-bridge
+# 或本地构建：
+git clone https://github.com/mrfacecheck/codex-bridge.git
+cd codex-bridge && npm install && npm run build
 ```
 
-验证：让 Claude 执行 `codex_sessions doctor`。
+验证：在客户端中调用 `codex_sessions`，参数 `{"action": "doctor"}`。
 
 ## 架构
 
@@ -61,33 +66,57 @@ codex_sessions get
 
 | 工具 | 用途 |
 |------|------|
-| `codex_exec` | 启动任务。参数：`task`, `cwd`, `sandbox`, `timeout`, `execution_mode`, `wait_budget_seconds` |
-| `codex_resume` | 继续会话。参数：`session_id`, `task` |
-| `codex_sessions` | 管理运行。动作：`list`, `get`, `stop`, `doctor`。get 参数：`view`, `wait_seconds`, `since_seq`, `max_chars` |
+| `codex_exec` | 启动任务。参数：`task`, `cwd`, `sandbox`, `timeout`, `execution_mode`, `wait_budget_seconds`, `return_view` (`full`\|`summary`), `isolation` (`inplace`\|`worktree`), `base`, `model`, `effort`, `acceptance`, `non_goals`, `output_schema`, `grants_mcp` |
+| `codex_resume` | 继续会话（继承 worktree 与影子 `CODEX_HOME`）。参数：`session_id`, `task`, `effort`, `acceptance`, `non_goals`, `return_view` |
+| `codex_sessions` | 管理运行。动作：`list`, `get`, `stop`, `doctor`, `cleanup`。get 参数：`view`, `wait_seconds`, `since_seq`, `max_chars` |
 
 ## 源码结构
 
 ```
 src/
-├── index.ts        MCP server、view 系统、long-poll、动态超时
+├── index.ts        MCP server、协议级 instructions、view 系统、long-poll、动态超时
 ├── worker.ts       独立 worker：加锁 → 快照 → Codex → 快照 → review
-├── evidence.ts     Git 操作、diff、敏感检测、代理环境、进程管理
-├── progress.ts     持久化状态（~/.codex-bridge/）、增量事件
+├── evidence.ts     Codex 自动探测、Git 操作、diff、敏感检测、代理环境、进程管理
+├── grants.ts       影子 CODEX_HOME（默认零 MCP + 安全继承模型与 provider 默认配置）
+├── progress.ts     持久化状态（~/.codex-bridge/ 或 CODEX_BRIDGE_HOME）、增量事件
 ├── types.ts        共享类型和常量
 └── statusline.ts   终端状态栏（仅 CLI 模式）
 ```
 
 ## 安装
 
+**Antigravity** — 加入 `~/.gemini/config/mcp_config.json`：
+```json
+{
+  "mcpServers": {
+    "codex-bridge": {
+      "command": "node",
+      "args": ["/absolute/path/to/codex-bridge/dist/index.js"],
+      "env": {
+        "CODEX_BRIDGE_MAX_WAIT_SECONDS": "60"
+      }
+    }
+  }
+}
+```
+
 **Claude Code：**
 ```bash
-claude mcp add codex-bridge -- npx codex-bridge
+claude mcp add codex-bridge -- node /absolute/path/to/codex-bridge/dist/index.js
 ```
 
 **Claude Desktop** — 加入 `claude_desktop_config.json`：
 ```json
-{ "mcpServers": { "codex-bridge": { "command": "npx", "args": ["codex-bridge"] } } }
+{ "mcpServers": { "codex-bridge": { "command": "node", "args": ["/absolute/path/to/codex-bridge/dist/index.js"] } } }
 ```
+
+### 可选环境变量
+
+| 变量 | 用途 |
+|------|------|
+| `CODEX_BINARY` | 显式指定 `codex` 路径（默认自动探测 `Codex.app`、`~/.local/bin`、standalone、Homebrew 与 `PATH`） |
+| `CODEX_BRIDGE_HOME` | 重定向持久化状态目录（默认 `~/.codex-bridge`） |
+| `CODEX_BRIDGE_MAX_WAIT_SECONDS` | 限制长轮询与同步等待上限（`10..240`，默认 `240`），适配较紧的 MCP 客户端超时 |
 
 ## 边界
 
