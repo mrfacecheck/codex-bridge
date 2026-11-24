@@ -38,10 +38,9 @@ SKILL.md            Operational agent playbook
 ## Development Commands
 
 ```bash
-npm run build                    # Compile TypeScript to dist/
-npm test                         # Run full 91-test suite (offline deterministic + chaos)
-npx tsc --noEmit                 # Type-check without emitting
-npm pack --dry-run               # Preview packaged files
+pnpm build                       # Compile TypeScript to dist/
+pnpm test                        # Run full 91-test suite (offline deterministic + chaos)
+pnpm exec tsc --noEmit           # Type-check without emitting
 ./scripts/build-patched-codex.sh # macOS: build/update bridge-private kernel-patched codex
 ```
 
@@ -50,4 +49,4 @@ npm pack --dry-run               # Preview packaged files
 - Use Conventional Commits (`feat(...)`, `fix(...)`, `docs(...)`, `chore(...)`).
 - Never commit personal hostnames, SSH keys, local paths, or test scratch files (e.g. `OUT.txt`).
 - Keep `SKILL.md`, `README.md`, `README.zh-CN.md`, `CHANGELOG.md`, and `SERVER_INSTRUCTIONS` in `src/index.ts` aligned whenever behavior or defaults change.
-- Tag milestone releases (`v3.1.0`, etc.) after `npm run build && npm test` pass cleanly.
+- Tag milestone releases (`v3.1.0`, etc.) after `pnpm build && pnpm test` pass cleanly.

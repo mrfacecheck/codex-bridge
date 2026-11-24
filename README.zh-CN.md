@@ -19,17 +19,11 @@ MCP 客户端 (Antigravity / Claude Code / Cursor)
 
 ## 快速开始
 
-推荐直接从 GitHub 安装或本地构建（npm registry 仍停在 2.2.7）：
-
-```bash
-npm install -g github:mrfacecheck/codex-bridge
-```
-
-或本地克隆构建：
+从 GitHub 克隆并在本地构建：
 
 ```bash
 git clone https://github.com/mrfacecheck/codex-bridge.git
-cd codex-bridge && npm install && npm run build
+cd codex-bridge && pnpm install && pnpm build
 ```
 
 验证：在 MCP 客户端中调用 `codex_sessions`，参数 `{"action": "doctor"}`。

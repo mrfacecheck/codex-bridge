@@ -276,7 +276,7 @@ function resolveTsx(): string {
   const localTsx = path.resolve(__dirname, "..", "node_modules", ".bin", "tsx");
   if (existsSync(localTsx)) return localTsx;
   try { execFileSync("which", ["tsx"], { stdio: "ignore" }); return "tsx"; } catch {}
-  throw new Error("tsx not found. Install it: npm install tsx");
+  throw new Error("tsx not found. Run pnpm install.");
 }
 
 function workerCommand(runDir: string): WorkerCommand {
@@ -1302,8 +1302,14 @@ async function getMultipleRuns(
     }
     const rd = getRunDir(id);
     const rec = await reconcileRunAsync(rd);
-    const rev = rec.progress?.revision ?? rec.progress?.seq ?? 0;
-    nextCursor[id] = Math.max(nextCursor[id] ?? 0, rev);
+    const baseRev = rec.progress?.revision ?? rec.progress?.seq ?? 0;
+    // If review.json is already sealed while worker's trailing terminal updateProgress (+1 rev)
+    // is still in flight, ack through baseRev + 1 so the next wait_any never spuriously re-wakes
+    // on an already-delivered terminal review.
+    const ackRev = rec.review && rec.progress && !isTerminal(rec.progress.status)
+      ? baseRev + 1
+      : baseRev;
+    nextCursor[id] = Math.max(nextCursor[id] ?? 0, ackRev);
     runs[id] = renderRunView(id, view, maxChars, sinceSeq);
   }
 

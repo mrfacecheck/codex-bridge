@@ -1,54 +1,23 @@
 {
-  "name": "@codex-bridge/core",
+  "name": "codex-bridge",
   "version": "3.1.0",
+  "private": true,
   "description": "Run-scoped MCP execution & evidence kernel bridging MCP coding agents and OpenAI Codex — isolated snapshot repos, out-of-band Git tree evidence, private 3-way merge-tree & recoverable apply, sleep-immune attention, wait-any orchestration, and macOS Seatbelt kernel browser exec-deny protection",
   "type": "module",
   "bin": {
     "codex-bridge": "./bin/codex-bridge.mjs"
   },
-  "files": [
-    "dist",
-    "bin",
-    "patches",
-    "scripts",
-    "README.md",
-    "README.zh-CN.md",
-    "SKILL.md",
-    "LICENSE"
-  ],
   "scripts": {
     "start": "tsx src/index.ts",
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
-    "prepack": "npm run build",
-    "prepublishOnly": "npm run build",
-    "test": "node --test \"test/*.test.mjs\"",
-    "prepare": "npm run build"
+    "test": "node --test \"test/*.test.mjs\""
   },
-  "keywords": [
-    "mcp",
-    "model-context-protocol",
-    "antigravity",
-    "claude",
-    "codex",
-    "openai",
-    "anthropic",
-    "gemini",
-    "ai-collaboration",
-    "code-review",
-    "git-diff",
-    "evidence-layer"
-  ],
-  "author": "ycc",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mrfacecheck/codex-bridge.git"
+    "url": "https://github.com/mrfacecheck/codex-bridge.git"
   },
-  "bugs": {
-    "url": "https://github.com/mrfacecheck/codex-bridge/issues"
-  },
-  "homepage": "https://github.com/mrfacecheck/codex-bridge#readme",
   "engines": {
     "node": ">=18"
   },

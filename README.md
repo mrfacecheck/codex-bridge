@@ -19,17 +19,11 @@ MCP Client (Antigravity / Claude Code / Cursor)
 
 ## Quick start
 
-Canonical distribution is GitHub (npm registry is stale at 2.2.7):
-
-```bash
-npm install -g github:mrfacecheck/codex-bridge
-```
-
-Or clone and build locally:
+Clone from GitHub and build locally:
 
 ```bash
 git clone https://github.com/mrfacecheck/codex-bridge.git
-cd codex-bridge && npm install && npm run build
+cd codex-bridge && pnpm install && pnpm build
 ```
 
 Verify from your MCP client by running `codex_sessions` with `{"action": "doctor"}`.
