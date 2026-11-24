@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **macOS arm64 Prebuilt Kernel-Patched Codex Release Pipeline & Fast Installer**:
+  - Added GitHub Actions workflow [`.github/workflows/build-patched-codex.yml`](./.github/workflows/build-patched-codex.yml) (`workflow_dispatch` + `codex-v*` tags on `macos-15`) that runs `scripts/build-patched-codex.sh`, verifies the live XNU Seatbelt `deny process-exec` probe, packages `codex` + `codex-exec-server` + `BUILD_INFO.json` + `SHA256SUMS.txt`, self-tests `scripts/install-patched-codex.sh` against the tarball, and publishes to GitHub Releases.
+  - Added fail-closed installer [`scripts/install-patched-codex.sh`](./scripts/install-patched-codex.sh) verifying SHA-256, rejecting symlinked archive entries, running a live XNU Seatbelt `deny process-exec` probe on the staged binary before atomic installation into `~/.codex-bridge/bin/`.
+  - Added offline regression tests in [`test/patched-codex-scripts.test.mjs`](./test/patched-codex-scripts.test.mjs).
+
+### Fixed
+- **`scripts/build-patched-codex.sh` sibling binary build & hardening**: Fixed `cargo build --release` invocation to explicitly pass both `--bin codex --bin codex-exec-server` in one unified build pass, resolved patch filenames dynamically from the requested tag, respected `CODEX_BRIDGE_HOME` / `INSTALL_DIR` / `BUILD_ROOT` overrides, added `strip -x` + ad-hoc `codesign`, and gated completion on a live XNU Seatbelt `deny process-exec` verification probe.
+
 ## v3.1.0
 
 macOS Seatbelt kernel browser boundary, bridge-private patched `codex` integration, and full documentation/skill alignment.

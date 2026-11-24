@@ -71,13 +71,17 @@ Core decisions:
 
 On macOS, launching `/Applications/Google Chrome.app` (even `--headless`) or Playwright browsers inside Codex's Seatbelt sandbox aborts in `HIServices._RegisterApplication()` (`SIGABRT 134`) and floods the desktop with macOS crash dialogs.
 
-`codex-bridge` ships a minimal, auditable patch ([patches/codex-rs-v0.166.0-darwin-deny-exec.patch](./patches/codex-rs-v0.166.0-darwin-deny-exec.patch)) and reproducible builder ([scripts/build-patched-codex.sh](./scripts/build-patched-codex.sh)) that narrows `(allow process-exec)` inside Codex's own Seatbelt profile to deny configured GUI browser bundles and Playwright/Puppeteer caches at the XNU `mac_vnode_check_exec` boundary:
+`codex-bridge` ships a minimal, auditable patch ([patches/codex-rs-v0.166.0-darwin-deny-exec.patch](./patches/codex-rs-v0.166.0-darwin-deny-exec.patch)), a GitHub Actions macOS arm64 release pipeline ([.github/workflows/build-patched-codex.yml](./.github/workflows/build-patched-codex.yml)), a fast fail-closed prebuilt installer ([scripts/install-patched-codex.sh](./scripts/install-patched-codex.sh)), and a reproducible from-source builder ([scripts/build-patched-codex.sh](./scripts/build-patched-codex.sh)) that narrows `(allow process-exec)` inside Codex's own Seatbelt profile to deny configured GUI browser bundles and Playwright/Puppeteer caches at the XNU `mac_vnode_check_exec` boundary:
 
 ```bash
+# Fast path (~5s, Apple Silicon): downloads prebuilt GitHub Release, verifies SHA-256 + live Seatbelt probe
+./scripts/install-patched-codex.sh
+
+# Or build reproducibly from source (requires rustup / cargo):
 ./scripts/build-patched-codex.sh
 ```
 
-- Installs a bridge-private binary suite into `~/.codex-bridge/bin/` (`codex`, `codex-exec-server`, `codex-code-mode-host`) — **never overwrites `~/.local/bin/codex`**.
+- Installs a bridge-private binary suite into `~/.codex-bridge/bin/` (`codex`, `codex-exec-server`, and sibling `codex-code-mode-host` when installed) — **never overwrites `~/.local/bin/codex`**.
 - `resolveCodexBinary()` automatically prefers `~/.codex-bridge/bin/codex` (while `CODEX_BINARY` still overrides explicitly).
 - Verify enforcement live via `codex_sessions({ "action": "doctor" })` → `darwin_exec_deny_enforced: true`.
 - To revert to stock Codex at any time, delete `~/.codex-bridge/bin/`.
@@ -107,8 +111,11 @@ bin/
 patches/
 └── codex-rs-v0.166.0-darwin-deny-exec.patch  Minimal Seatbelt process-exec deny patch for openai/codex
 scripts/
-└── build-patched-codex.sh  Reproducible builder for ~/.codex-bridge/bin/ private codex suite
-test/               91 deterministic unit, bridge, grants, worker, and chaos tests
+├── install-patched-codex.sh  Fast SHA-256 + Seatbelt-verified prebuilt installer from GitHub Releases
+└── build-patched-codex.sh    Reproducible from-source builder for ~/.codex-bridge/bin/ private codex suite
+.github/workflows/
+└── build-patched-codex.yml   macOS arm64 release builder (manual workflow_dispatch / codex-v* tags)
+test/               Deterministic unit, bridge, grants, worker, script, and chaos tests
 SKILL.md            Agent operational playbook (compatible with Antigravity / Claude Code / Codex skills)
 ```
 

@@ -1,0 +1,249 @@
+name: Build macOS Patched Codex
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_tag:
+        description: "Upstream openai/codex git tag (e.g. rust-v0.166.0)"
+        required: true
+        default: "rust-v0.166.0"
+        type: string
+      release_tag:
+        description: "GitHub Release tag (e.g. codex-v0.166.0)"
+        required: true
+        default: "codex-v0.166.0"
+        type: string
+      publish_release:
+        description: "Publish tarball & SHA256SUMS.txt to GitHub Release"
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "codex-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched-codex-${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-darwin-arm64:
+    name: macOS arm64 (Seatbelt deny-exec)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout codex-bridge
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate build parameters
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_CODEX_TAG: ${{ inputs.codex_tag }}
+          IN_RELEASE_TAG: ${{ inputs.release_tag }}
+          IN_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            RELEASE_TAG="${REF_NAME}"
+            CODEX_TAG="rust-${RELEASE_TAG#codex-}"
+            PUBLISH="true"
+          else
+            CODEX_TAG="${IN_CODEX_TAG}"
+            RELEASE_TAG="${IN_RELEASE_TAG}"
+            PUBLISH="${IN_PUBLISH}"
+          fi
+
+          if [[ ! "${CODEX_TAG}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: invalid codex_tag '${CODEX_TAG}'" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_TAG}" =~ ^codex-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: invalid release_tag '${RELEASE_TAG}'" >&2
+            exit 1
+          fi
+
+          VER="${CODEX_TAG#rust-}"
+          ASSET_VER="${RELEASE_TAG#codex-}"
+          PATCH_FILE="patches/codex-rs-${VER}-darwin-deny-exec.patch"
+          if [[ ! -f "${PATCH_FILE}" ]]; then
+            echo "error: matching patch not found: ${PATCH_FILE}" >&2
+            exit 1
+          fi
+          PATCH_SHA256="$(shasum -a 256 "${PATCH_FILE}" | awk '{print $1}')"
+
+          {
+            echo "codex_tag=${CODEX_TAG}"
+            echo "ver=${VER}"
+            echo "asset_ver=${ASSET_VER}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "publish=${PUBLISH}"
+            echo "patch_file=${PATCH_FILE}"
+            echo "patch_sha256=${PATCH_SHA256}"
+            echo "target=darwin-arm64"
+            echo "asset=codex-bridge-patched-codex-${ASSET_VER}-darwin-arm64.tar.gz"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "codex_tag=${CODEX_TAG} release_tag=${RELEASE_TAG} publish=${PUBLISH}"
+          echo "patch=${PATCH_FILE} sha256=${PATCH_SHA256}"
+          df -h "${RUNNER_TEMP}"
+
+      - name: Ensure Rust toolchain is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          rustup --version
+          cargo --version
+
+      - name: Build, test, and verify patched codex suite
+        id: build
+        shell: bash
+        env:
+          BUILD_ROOT: ${{ runner.temp }}/build/codex-${{ steps.meta.outputs.ver }}
+          INSTALL_DIR: ${{ runner.temp }}/dist
+        run: |
+          set -euo pipefail
+          ./scripts/build-patched-codex.sh "${{ steps.meta.outputs.codex_tag }}"
+          UPSTREAM_SHA="$(git -C "${BUILD_ROOT}" rev-parse HEAD)"
+          CODEX_VERSION="$("${INSTALL_DIR}/codex" --version)"
+          {
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "codex_version=${CODEX_VERSION}"
+          } >> "${GITHUB_OUTPUT}"
+          rm -rf "${BUILD_ROOT}"
+          df -h "${RUNNER_TEMP}"
+
+      - name: Package release tarball and SHA256SUMS
+        shell: bash
+        env:
+          DIST_DIR: ${{ runner.temp }}/dist
+          REL_DIR: ${{ runner.temp }}/release
+          ASSET: ${{ steps.meta.outputs.asset }}
+          META_CODEX_TAG: ${{ steps.meta.outputs.codex_tag }}
+          META_UPSTREAM_SHA: ${{ steps.build.outputs.upstream_sha }}
+          META_CODEX_VERSION: ${{ steps.build.outputs.codex_version }}
+          META_PATCH_FILE: ${{ steps.meta.outputs.patch_file }}
+          META_PATCH_SHA256: ${{ steps.meta.outputs.patch_sha256 }}
+          META_TARGET: ${{ steps.meta.outputs.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${REL_DIR}"
+
+          python3 - "${DIST_DIR}/BUILD_INFO.json" <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+          info = {
+              "codex_tag": os.environ["META_CODEX_TAG"],
+              "upstream_commit": os.environ["META_UPSTREAM_SHA"],
+              "codex_version": os.environ["META_CODEX_VERSION"],
+              "patch_file": os.environ["META_PATCH_FILE"],
+              "patch_sha256": os.environ["META_PATCH_SHA256"],
+              "bridge_commit": os.environ["GITHUB_SHA"],
+              "target": os.environ["META_TARGET"],
+              "darwin_exec_deny_verified": True,
+              "built_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              json.dump(info, f, indent=2)
+              f.write("\n")
+          PY
+
+          tar -czf "${REL_DIR}/${ASSET}" -C "${DIST_DIR}" codex codex-exec-server BUILD_INFO.json
+          (
+            cd "${REL_DIR}"
+            shasum -a 256 "${ASSET}" > SHA256SUMS.txt
+          )
+          ls -lh "${REL_DIR}"
+          cat "${REL_DIR}/SHA256SUMS.txt"
+
+      - name: Self-test install-patched-codex.sh against packaged release
+        shell: bash
+        env:
+          CODEX_BRIDGE_HOME: ${{ runner.temp }}/smoke-home
+          CODEX_BRIDGE_RELEASE_BASE_URL: file://${{ runner.temp }}/release
+        run: |
+          set -euo pipefail
+          ./scripts/install-patched-codex.sh "${{ steps.meta.outputs.release_tag }}"
+          "${CODEX_BRIDGE_HOME}/bin/codex" --version
+          test -x "${CODEX_BRIDGE_HOME}/bin/codex-exec-server"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-codex-${{ steps.meta.outputs.ver }}-${{ steps.meta.outputs.target }}
+          path: |
+            ${{ runner.temp }}/release/${{ steps.meta.outputs.asset }}
+            ${{ runner.temp }}/release/SHA256SUMS.txt
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REL_DIR: ${{ runner.temp }}/release
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          CODEX_TAG: ${{ steps.meta.outputs.codex_tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          UPSTREAM_SHA: ${{ steps.build.outputs.upstream_sha }}
+          CODEX_VERSION: ${{ steps.build.outputs.codex_version }}
+          PATCH_FILE: ${{ steps.meta.outputs.patch_file }}
+          PATCH_SHA256: ${{ steps.meta.outputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          CHECKSUMS="$(cat "${REL_DIR}/SHA256SUMS.txt")"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+          cat > "${NOTES_FILE}" <<EOF
+          Prebuilt bridge-private macOS \`codex\` suite with XNU Seatbelt kernel \`deny process-exec\` hardening for GUI browsers and Playwright/Puppeteer caches.
+
+          ### Quick Install (macOS Apple Silicon, ~5s)
+
+          \`\`\`bash
+          ./scripts/install-patched-codex.sh ${RELEASE_TAG}
+          \`\`\`
+
+          Verifies SHA-256 and runs a live XNU Seatbelt \`deny process-exec\` kernel probe before atomically installing into \`~/.codex-bridge/bin/\` (never overwrites \`~/.local/bin/codex\`).
+
+          ### Build Provenance
+
+          | Field | Value |
+          | --- | --- |
+          | Upstream \`openai/codex\` tag | \`${CODEX_TAG}\` (\`${UPSTREAM_SHA}\`) |
+          | Built CLI version | \`${CODEX_VERSION}\` |
+          | Patch | \`${PATCH_FILE}\` |
+          | Patch SHA-256 | \`${PATCH_SHA256}\` |
+          | Target | \`darwin-arm64\` (\`macos-15\`) |
+          | Live Seatbelt probe | Passed (\`darwin_exec_deny_enforced: true\`) |
+
+          ### Checksums (\`SHA256SUMS.txt\`)
+
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+          EOF
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              "${REL_DIR}/${ASSET}" \
+              "${REL_DIR}/SHA256SUMS.txt" \
+              --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --title "Patched Codex ${CODEX_TAG} (macOS Seatbelt deny-exec)" \
+              --notes-file "${NOTES_FILE}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              "${REL_DIR}/${ASSET}" \
+              "${REL_DIR}/SHA256SUMS.txt" \
+              --target "${GITHUB_SHA}" \
+              --title "Patched Codex ${CODEX_TAG} (macOS Seatbelt deny-exec)" \
+              --notes-file "${NOTES_FILE}"
+          fi

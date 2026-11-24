@@ -10,7 +10,7 @@
 4. **Zero-MCP default surface**: Workers run inside a shadow `CODEX_HOME` exposing only explicitly granted MCP servers; repo-level `.codex/config.toml` MCP injections fail closed.
 5. **macOS Seatbelt browser boundary**: Never ask sandboxed macOS workers to run GUI `.app` browsers or Playwright/Puppeteer screenshots. `codex-bridge` layers:
    - **P0**: `HOST_VISUAL_QA_REQUIRED` contract injected into macOS sandboxed tasks.
-   - **P1**: Bridge-private patched `codex` suite (`~/.codex-bridge/bin/`, built via `scripts/build-patched-codex.sh` + `patches/codex-rs-v0.166.0-darwin-deny-exec.patch`) enforcing XNU Seatbelt `deny process-exec` via `CODEX_BRIDGE_DENY_EXEC_SUBPATHS` and verified live by `doctor.darwin_exec_deny_enforced`.
+   - **P1**: Bridge-private patched `codex` suite (`~/.codex-bridge/bin/`, installed via `scripts/install-patched-codex.sh` from GitHub Releases or built from source via `scripts/build-patched-codex.sh` + `patches/codex-rs-v0.166.0-darwin-deny-exec.patch`) enforcing XNU Seatbelt `deny process-exec` via `CODEX_BRIDGE_DENY_EXEC_SUBPATHS` and verified live by `doctor.darwin_exec_deny_enforced`.
    - **P2**: Shadow `rules/darwin-no-browser.rules` + 1-shot `sandbox_gui_crash` attention in `src/worker.ts`.
 
 ## Repository Layout
@@ -30,18 +30,22 @@ bin/
 patches/
 └── codex-rs-v0.166.0-darwin-deny-exec.patch  Minimal Seatbelt process-exec deny patch
 scripts/
-└── build-patched-codex.sh  Reproducible builder for ~/.codex-bridge/bin/ private codex suite
-test/               91 deterministic unit, bridge, grants, worker, and chaos tests
+├── install-patched-codex.sh  Fail-closed prebuilt installer (SHA-256 + live Seatbelt probe)
+└── build-patched-codex.sh    Reproducible builder for ~/.codex-bridge/bin/ private codex suite
+.github/workflows/
+└── build-patched-codex.yml   macOS arm64 release pipeline (workflow_dispatch / codex-v* tags)
+test/               Deterministic unit, bridge, grants, worker, script, and chaos tests
 SKILL.md            Operational agent playbook
 ```
 
 ## Development Commands
 
 ```bash
-pnpm build                       # Compile TypeScript to dist/
-pnpm test                        # Run full 91-test suite (offline deterministic + chaos)
-pnpm exec tsc --noEmit           # Type-check without emitting
-./scripts/build-patched-codex.sh # macOS: build/update bridge-private kernel-patched codex
+pnpm build                         # Compile TypeScript to dist/
+pnpm test                          # Run full deterministic + chaos test suite
+pnpm exec tsc --noEmit             # Type-check without emitting
+./scripts/install-patched-codex.sh # macOS arm64: install prebuilt kernel-patched codex (~5s)
+./scripts/build-patched-codex.sh   # macOS: build/update bridge-private kernel-patched codex from source
 ```
 
 ## Release & Commit Hygiene

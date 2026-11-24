@@ -71,13 +71,17 @@ codex_sessions apply
 
 在 macOS 上，在 Codex 的 Seatbelt 沙箱内启动 `/Applications/Google Chrome.app`（即便是 `--headless`）或 Playwright 浏览器，会在 `HIServices._RegisterApplication()` 触发 `SIGABRT (134)` 并引发系统「意外退出」弹窗风暴。
 
-本仓库提供极简可审计补丁（[patches/codex-rs-v0.166.0-darwin-deny-exec.patch](./patches/codex-rs-v0.166.0-darwin-deny-exec.patch)）与一键复现构建脚本（[scripts/build-patched-codex.sh](./scripts/build-patched-codex.sh)），在 Codex 自身的 Seatbelt 策略内收窄 `(allow process-exec)`，于 XNU `mac_vnode_check_exec` 阶段直接拒绝受禁浏览器 bundle 与 Playwright/Puppeteer 缓存的执行：
+本仓库提供极简可审计补丁（[patches/codex-rs-v0.166.0-darwin-deny-exec.patch](./patches/codex-rs-v0.166.0-darwin-deny-exec.patch)）、GitHub Actions macOS arm64 自动构建发布流（[.github/workflows/build-patched-codex.yml](./.github/workflows/build-patched-codex.yml)）、秒级预编译安装脚本（[scripts/install-patched-codex.sh](./scripts/install-patched-codex.sh)）与一键源码复现构建脚本（[scripts/build-patched-codex.sh](./scripts/build-patched-codex.sh)），在 Codex 自身的 Seatbelt 策略内收窄 `(allow process-exec)`，于 XNU `mac_vnode_check_exec` 阶段直接拒绝受禁浏览器 bundle 与 Playwright/Puppeteer 缓存的执行：
 
 ```bash
+# 快速通道（Apple Silicon ~5 秒）：下载 GitHub Release 预编译包，fail-closed 校验 SHA-256 + 实机 Seatbelt 探针
+./scripts/install-patched-codex.sh
+
+# 或从源码本地复现构建（需安装 rustup / cargo）：
 ./scripts/build-patched-codex.sh
 ```
 
-- 将桥接私有三件套安装到 `~/.codex-bridge/bin/`（`codex`、`codex-exec-server`、`codex-code-mode-host`），**绝不覆盖全局 `~/.local/bin/codex`**。
+- 将桥接私有套件安装到 `~/.codex-bridge/bin/`（`codex`、`codex-exec-server`，以及本机存在时的同版本 `codex-code-mode-host`），**绝不覆盖全局 `~/.local/bin/codex`**。
 - `resolveCodexBinary()` 自动优先使用 `~/.codex-bridge/bin/codex`（仍支持 `CODEX_BINARY` 显式覆写）。
 - 在 MCP 客户端执行 `codex_sessions({ "action": "doctor" })`，确认 `darwin_exec_deny_enforced: true` 即表示内核防线已生效。
 - 随时删掉 `~/.codex-bridge/bin/` 即可无痛回到官方原版 CLI。
@@ -107,8 +111,11 @@ bin/
 patches/
 └── codex-rs-v0.166.0-darwin-deny-exec.patch  针对 openai/codex 的极简 Seatbelt 禁执行补丁
 scripts/
-└── build-patched-codex.sh  一键构建 ~/.codex-bridge/bin/ 私有补丁套件
-test/               91 项确定性单元、桥接、授权、worker 与混沌测试
+├── install-patched-codex.sh  从 GitHub Release 秒装预编译套件（SHA-256 + Seatbelt 实测校验）
+└── build-patched-codex.sh    从源码一键复现构建 ~/.codex-bridge/bin/ 私有补丁套件
+.github/workflows/
+└── build-patched-codex.yml   macOS arm64 自动编译并发布 Release（手动触发或 codex-v* tag）
+test/               确定性单元、桥接、授权、worker、脚本与混沌测试
 SKILL.md            智能体协作规范（兼容 Antigravity / Claude Code / Codex Skills）
 ```
 

@@ -24,7 +24,7 @@ Verify:
 - `codex_version.ok`, `codex_auth.ok`, `git_version.ok`, `cli_probe.mcpListSupported`, and `bridge_home_writable`.
 - On **macOS**, check `darwin_exec_deny_enforced`:
   - `true`: bridge-private patched `codex` (`~/.codex-bridge/bin/codex`) is active and enforces XNU Seatbelt `deny process-exec` for GUI browsers.
-  - `false`: only bridge-layer P0/P2 mitigations (contract + `rules/` + `sandbox_gui_crash` attention) are active; build the private kernel binary via `scripts/build-patched-codex.sh` when full kernel blocking is required.
+  - `false`: only bridge-layer P0/P2 mitigations (contract + `rules/` + `sandbox_gui_crash` attention) are active; install the prebuilt private kernel binary via `scripts/install-patched-codex.sh` (or build from source via `scripts/build-patched-codex.sh`) when full kernel blocking is required.
 
 ## 2. Launching Work (`codex_exec`)
 
