@@ -104,7 +104,7 @@ async function main() {
       prepareResult = await runPrepareStep(meta.prepare, runCwd, runDir);
       if (!prepareResult.ok) {
         const msg = `Workspace prepare failed (${prepareResult.error || `exit ${prepareResult.exit_code}`}). Codex was not invoked.`;
-        updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message: msg, error: msg });
+        // Seal review packet BEFORE terminal progress so fs.watch waiters never observe terminal status without review-packet.json.
         writeReviewPacket(runDir, {
           run_id: runId, async: false, status: "failed", phase: "terminal", outcome: "failed", liveness: "gone",
           status_detail: "prepare_failed", failure_hint: "prepare_failed",
@@ -112,6 +112,7 @@ async function main() {
           workspace_id: meta.workspaceId, workspace_kind: meta.workspaceKind,
           prepare: prepareResult, error: msg, warnings: [msg],
         });
+        updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message: msg, error: msg });
         return;
       }
     }
@@ -162,11 +163,11 @@ async function main() {
 
     if (gitRepo && !allowLargeUntracked) {
       try { assertSnapshotSafe(gitRoot, 256); } catch (e: any) {
-        updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message: e.message, error: e.message });
         writeReviewPacket(runDir, {
           run_id: runId, async: false, status: "failed", phase: "terminal", outcome: "failed", liveness: "gone",
           error: `Codex created large untracked files. ${e.message}`, cwd: runCwd, git_root: gitRoot,
         });
+        updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message: e.message, error: e.message });
         return;
       }
     }
@@ -449,12 +450,12 @@ async function main() {
 }
 
 function fail(message: string, meta?: RunMeta | null) {
-  updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message, error: message });
   writeReviewPacket(runDir, {
     run_id: meta?.runId ?? readRunMeta(runDir)?.runId,
     async: false, status: "failed", phase: "terminal", outcome: "failed", liveness: "gone",
     error: message,
   });
+  updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message, error: message });
 }
 
 function ensurePrivateFile(fp: string) {
@@ -1024,13 +1025,13 @@ main().catch((e) => {
   const message = e?.message || String(e);
   try {
     const meta = readRunMeta(runDir);
-    updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message, error: message });
     writeReviewPacket(runDir, {
       run_id: meta?.runId, async: false, status: "failed", phase: "terminal", outcome: "failed", liveness: "gone",
       status_detail: "worker_failed_before_review", cwd: meta?.cwd,
       git_root: meta?.gitRoot || undefined, error: message,
       warnings: ["Worker failed before review packet was finalized. Evidence may be incomplete."],
     });
+    updateProgress(runDir, { status: "failed", phase: "terminal", liveness: "gone", message, error: message });
   } catch {}
   process.stderr.write(`worker fatal: ${message}\n`);
   process.exit(1);

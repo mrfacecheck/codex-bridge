@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.1.0
+
+macOS Seatbelt kernel browser boundary, bridge-private patched `codex` integration, and full documentation/skill alignment.
+
+### Added
+- **XNU Seatbelt Kernel `deny process-exec` Patch (P1)**:
+  - Added reproducible patch [`patches/codex-rs-v0.166.0-darwin-deny-exec.patch`](./patches/codex-rs-v0.166.0-darwin-deny-exec.patch) and builder [`scripts/build-patched-codex.sh`](./scripts/build-patched-codex.sh) targeting `openai/codex` `rust-v0.166.0` (`codex-rs/sandboxing/src/seatbelt.rs`).
+  - Reads parent-process `CODEX_BRIDGE_DENY_EXEC_SUBPATHS`, normalizes top-level aliases and symlinks, narrows `(allow process-exec)` with `(require-all (require-not ...))`, and appends explicit `(deny process-exec ...)` so blocked macOS GUI browsers fail with `EPERM` at `mac_vnode_check_exec` before entering `ChromeMain` / `HIServices._RegisterApplication` (zero `SIGABRT 134`, zero macOS crash dialog storms). Byte-for-byte identical to upstream when unset.
+  - Installs bridge-private suite (`codex`, `codex-exec-server`, `codex-code-mode-host`) into `~/.codex-bridge/bin/` without touching `~/.local/bin/codex`.
+- **Automatic Private Binary Discovery & Live Kernel `doctor` Probe**:
+  - `resolveCodexBinary()` now prefers `~/.codex-bridge/bin/codex` (while `CODEX_BINARY` remains highest priority).
+  - `buildCodexEnv({ sandbox })` injects the curated macOS browser bundle + Playwright/Puppeteer cache deny list (`CODEX_BRIDGE_DENY_EXEC_SUBPATHS`, extendable via `CODEX_BRIDGE_EXTRA_DENY_EXEC_SUBPATHS`) for non-`danger-full-access` runs.
+  - `probeCodexCapabilities()` and `codex_sessions(action="doctor")` now execute a fast zero-token kernel probe and report `darwin_exec_deny_enforced: true | false`.
+- **Bridge-Side Capability Contract, Shadow Rules & Non-Retryable Attention (P0 + P2)**:
+  - Injects the 4-line `HOST_VISUAL_QA_REQUIRED` macOS sandbox capability contract into `codex_exec` and `codex_resume`.
+  - Provisions read-only (`0444`) `<mcpHome>/rules/darwin-no-browser.rules` outside the worker writable root.
+  - Adds 1-shot `sandbox_gui_crash` attention in `src/worker.ts` for high-confidence macOS browser abort or `EPERM` / `HOST_VISUAL_QA_REQUIRED` denials.
+
+### Fixed
+- **Worker fail-path write-before-publish barrier**: All failure exits in `src/worker.ts` (including `prepare` failures, large-untracked aborts, `fail()`, and fatal catches) now durably write `review-packet.json` *before* publishing terminal `progress.json`, eliminating the `fs.watch` race where `pollForCompletion()` could observe `status="failed"` before `failure_hint` / `prepare` metadata hit disk.
+
+### Cleaned
+- Removed accidentally tracked test artifact `OUT.txt` and scrubbed legacy personal deployment notes from `CLAUDE.md`.
+- Aligned `SKILL.md`, `README.md`, `README.zh-CN.md`, `CLAUDE.md`, and `SERVER_INSTRUCTIONS` in `src/index.ts` to v3.1.0 defaults and invariants.
+
 ## v3.0.0
 
 Architectural kernel rewrite grounded in first-principles systems invariants (ownership, durability, evidence sealing, and honest uncertainty).

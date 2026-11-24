@@ -622,7 +622,7 @@ function renderRunView(
 
 // ── MCP Server ───────────────────────────────────────────────────
 const SERVER_INSTRUCTIONS = [
-  "codex-bridge v3 is a run-scoped MCP execution & evidence kernel for OpenAI Codex CLI.",
+  "codex-bridge v3.1 is a run-scoped MCP execution & evidence kernel for OpenAI Codex CLI.",
   "",
   "Recommended workflow:",
   "1. Write tasks: prefer isolation='worktree' (backed by an isolated snapshot repository + out-of-band evidence.git with immutable origin_tree). Pass base='working_tree' if you explicitly want uncommitted parent edits snapshotted as origin; default base='HEAD'. Harvest finished changes cleanly with codex_sessions(action='apply', run_id=..., dry_run=true|false, cleanup=true) — uses private-store 3-way merge-tree and single-file atomic, multi-file crash-recoverable materialization without touching parent git index/HEAD.",
@@ -630,6 +630,7 @@ const SERVER_INSTRUCTIONS = [
   "3. Idempotency & crash recovery: pass idempotency_key on codex_exec/codex_resume/apply for at-most-once admission across retries. If a worker dies unexpectedly, reconcile salvages direct-FD JSONL logs, session ID, and disk tree automatically once the writer exits (or reports liveness='unknown' while preserving the workspace).",
   "4. Follow-ups on the same task: use codex_resume with session_id (reuses workspace, evidence.git, effort, budgets, and shadow CODEX_HOME). Start an unrelated task with codex_exec.",
   "5. Always provide self-contained task specs (Codex has no prior chat context); include acceptance, non_goals, and optional model-free prepare={command,args} for dependency setup.",
+  "6. macOS browser/screenshot tasks: sandboxed macOS workers do NOT provide GUI browser execution (blocked at contract, rules, and optional XNU Seatbelt kernel level). If a worker reports HOST_VISUAL_QA_REQUIRED or raises sandbox_gui_crash, run visual QA on the host instead of retrying inside the sandbox.",
 ].join("\n");
 
 const server = new McpServer(
