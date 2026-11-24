@@ -1137,6 +1137,7 @@ server.tool("codex_sessions", "List, inspect, wait on (single or multi-run wait-
       bridge_version: PKG_VERSION,
       codex_binary: CODEX_BINARY,
       ...(CODEX_BINARY_REALPATH && CODEX_BINARY_REALPATH !== CODEX_BINARY ? { codex_binary_realpath: CODEX_BINARY_REALPATH } : {}),
+      darwin_exec_deny_enforced: cliProbe.darwinExecDenyEnforced,
       codex_version: codexVersion,
       codex_auth: codexAuth,
       cli_probe: cliProbe,

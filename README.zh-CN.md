@@ -46,12 +46,11 @@ codex_sessions get
 
 核心设计：
 - **Worker 独立进程** — MCP 崩溃或 session 断连不会杀死 Codex。
-- **Diff 限定本次运行** — 隔离的 git object 目录，排除已有的 dirty 文件，支持 `--binary` 完整补丁。
+- **独立快照仓库 + 旁路 Git 证据库（v3）** — 每个隔离工作区冻结不可变 `origin_tree` 到私有 `evidence.git` 对象库；即使 Codex 在工作区内自行 `git commit` 或修改 `.gitignore`，所有改动字节仍完整存证。
+- **私有 3-way merge-tree 与可恢复落盘（v3）** — `codex_sessions(action="apply", run_id=..., dry_run?, cleanup?)` 基于 `git merge-tree --write-tree` 与多轮 `codex_resume` 水位线合并落盘，保留主工作区已暂存/未暂存编辑，崩溃可恢复。
 - **视图渐进加载** — 调用方默认不加载完整 packet。`status → summary → diff` 按需获取。
-- **智能事件驱动长轮询** — `fs.watch` + 兜底定时器；`wait_for="terminal"`（默认）通用于所有视图（`summary`/`status`/`diff`/`output`/`review`），仅在终态、卡死或等待窗口结束时唤醒，告别逐条事件空转。
-- **基于活性的 `idle_timeout`（默认无墙钟硬超时）** — 取消 300s/900s/1200s 墙钟误杀（`timeout` 默认 `null`，仅按需显式开启），改由真实 Codex JSONL stdout 驱动的 `idle_timeout` 看门狗（默认 `900s`）清理真正卡死的任务。
-- **干净的活性信号与真实越界归因** — 后台 CLI `stderr` 噪声只进日志不污染进度或重置活性；`workspace-write` 下主工作区并行编辑记入 `concurrent_parent_changes`，不再误报 `WORKTREE ESCAPE`。
-- **一键 worktree 成果落盘** — `codex_sessions(action="apply", run_id=..., dry_run?, cleanup?)` 通过 `git apply --check` + 写锁原子落盘（多轮 `codex_resume` 自动合并完整 worktree diff）并支持落盘后自动回收。
+- **多路 `wait-any` 与抗休眠提醒（v3）** — `codex_sessions(action="get", run_ids=[...], wait_seconds=...)` 单次调用并发等待多个任务。`timeout` 与 `idle_timeout` 默认均为 `null`（绝不静默误杀正常推理）；抗休眠 `idle_attention_seconds`（默认 `900s`）、`repeated_failure` 与 `sandbox_gui_crash` 触发一次性 `attention` 唤醒调用方。
+- **macOS Seatbelt 内核级浏览器防线（v3.1）** — macOS 沙箱内启动 `.app` 浏览器会在 `HIServices._RegisterApplication` 触发 `SIGABRT (134)` 导致系统崩溃弹窗风暴。Bridge 提供 `HOST_VISUAL_QA_REQUIRED` 契约、影子 `rules/darwin-no-browser.rules`、`sandbox_gui_crash` 熔断提醒，以及可选的 100% XNU 内核级 `deny process-exec` 私有补丁二进制（`scripts/build-patched-codex.sh` + `patches/codex-rs-v0.166.0-darwin-deny-exec.patch`，安装至 `~/.codex-bridge/bin/codex`，不覆盖全局 `~/.local/bin/codex`，由 `doctor` 的 `darwin_exec_deny_enforced` 实时实测校验）。
 
 ## 证据保证
 
@@ -115,10 +114,12 @@ claude mcp add codex-bridge -- node /absolute/path/to/codex-bridge/dist/index.js
 
 | 变量 | 用途 |
 |------|------|
-| `CODEX_BINARY` | 显式指定 `codex` 路径（默认自动探测 `Codex.app`、`~/.local/bin`、standalone、Homebrew 与 `PATH`） |
+| `CODEX_BINARY` | 显式指定 `codex` 路径（默认优先探测 `~/.codex-bridge/bin/codex`，其次 `Codex.app`、`~/.local/bin`、standalone、Homebrew 与 `PATH`） |
 | `CODEX_BRIDGE_HOME` | 重定向持久化状态目录（默认 `~/.codex-bridge`） |
 | `CODEX_BRIDGE_MAX_WAIT_SECONDS` | 限制长轮询与同步等待上限（`10..600`，默认 `240`），适配较紧的 MCP 客户端超时 |
-| `CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT` | 覆盖默认活性看门狗 `idle_timeout` 秒数（`0` 禁用，`10..7200`，默认 `900`） |
+| `CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT` | 覆盖默认活性看门狗 `idle_timeout` 秒数（`0` 禁用，`10..7200`，默认 `null`） |
+| `CODEX_BRIDGE_DENY_EXEC_SUBPATHS` | 仅 macOS：覆盖冒号分隔的浏览器 bundle/缓存路径列表，由私有补丁 `codex` 在 XNU Seatbelt `process-exec` 层拦截 |
+| `CODEX_BRIDGE_EXTRA_DENY_EXEC_SUBPATHS` | 仅 macOS：向默认浏览器 `deny process-exec` 列表追加自定义绝对路径（冒号分隔） |
 
 ## 边界
 

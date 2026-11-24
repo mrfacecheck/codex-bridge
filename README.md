@@ -50,12 +50,11 @@ codex_sessions get
 
 Core decisions:
 - **Worker is detached** — MCP server crash or session disconnect doesn't kill Codex.
-- **Diff is run-scoped** — Isolated git object directory. Pre-existing dirty files excluded. Binary-safe `changes.patch`.
+- **Isolated snapshot repos + out-of-band Git tree evidence (v3)** — Each isolated workspace freezes an immutable `origin_tree` into a private `evidence.git` object store; even if Codex commits or edits `.gitignore` inside the workspace, every changed byte stays captured.
+- **Private 3-way merge-tree & recoverable apply (v3)** — `codex_sessions(action="apply", run_id=..., dry_run?, cleanup?)` merges via `git merge-tree --write-tree` with watermark tracking across multi-turn `codex_resume` sessions and atomic intent recovery, preserving parent staged/unstaged edits.
 - **Views are progressive** — Caller never loads full packet by default. `status → summary → diff` on demand.
-- **Smart event-driven long-poll** — `fs.watch` + fallback timer. `wait_for="terminal"` (default) works across all views (`summary`, `status`, `diff`, `output`, `review`) and wakes on completion/failure/stale instead of spamming every intermediate tick.
-- **Activity-based `idle_timeout` (no arbitrary wall cutoff)** — Runs have unlimited wall-clock time by default (`timeout: null`) and are guarded by an activity-driven `idle_timeout` watchdog (default `900s` with zero real Codex JSONL stdout events; `timeout` is opt-in).
-- **Clean liveness & true escape attribution** — Background CLI `stderr` never pollutes `progress.json` or resets liveness; parallel parent edits under `workspace-write` are reported in `concurrent_parent_changes` instead of false-positive `WORKTREE ESCAPE`.
-- **1-call worktree harvest** — `codex_sessions(action="apply", run_id=..., dry_run?, cleanup?)` validates via `git apply --check`, applies under write lock (supporting cumulative multi-turn resumed worktrees), and optionally cleans up.
+- **Wait-any & sleep-immune attention (v3)** — `codex_sessions(action="get", run_ids=[...], wait_seconds=...)` multiplexes multiple runs in one shared call. Both `timeout` and `idle_timeout` default to `null` (no silent auto-kill); sleep-immune `idle_attention_seconds` (default `900s`), `repeated_failure`, and `sandbox_gui_crash` raise 1-shot `attention` signals waking `wait_for="terminal"`.
+- **macOS Seatbelt kernel browser boundary (v3.1)** — Sandboxed macOS workers cannot safely launch GUI `.app` browsers (`HIServices._RegisterApplication` aborts with `SIGABRT 134` and floods the desktop with crash dialogs). The bridge enforces a `HOST_VISUAL_QA_REQUIRED` contract, shadow `rules/darwin-no-browser.rules`, 1-shot `sandbox_gui_crash` attention, and optional 100% kernel-level `deny process-exec` via a bridge-private patched `codex` binary (`scripts/build-patched-codex.sh` + `patches/codex-rs-v0.166.0-darwin-deny-exec.patch`, installed to `~/.codex-bridge/bin/codex` without touching `~/.local/bin/codex`, verified live by `doctor`'s `darwin_exec_deny_enforced`).
 
 ## Evidence guarantees
 
@@ -119,10 +118,12 @@ claude mcp add codex-bridge -- node /absolute/path/to/codex-bridge/dist/index.js
 
 | Variable | Purpose |
 |----------|---------|
-| `CODEX_BINARY` | Explicit path to `codex` CLI (auto-discovered from `Codex.app`, `~/.local/bin`, standalone, Homebrew, and `PATH` by default) |
+| `CODEX_BINARY` | Explicit path to `codex` CLI (auto-discovered from `~/.codex-bridge/bin/codex`, `Codex.app`, `~/.local/bin`, standalone, Homebrew, and `PATH` by default) |
 | `CODEX_BRIDGE_HOME` | Override durable state root (default `~/.codex-bridge`) |
 | `CODEX_BRIDGE_MAX_WAIT_SECONDS` | Clamp max long-poll / sync wait seconds (`10..600`, default `240`) for clients with tighter MCP timeouts |
-| `CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT` | Override default activity-based `idle_timeout` in seconds (`0` disables, `10..7200`, default `900`) |
+| `CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT` | Override default activity-based `idle_timeout` in seconds (`0` disables, `10..7200`, default `null`) |
+| `CODEX_BRIDGE_DENY_EXEC_SUBPATHS` | macOS only: override colon-delimited browser bundle/cache subpaths denied at XNU Seatbelt `process-exec` level by the bridge-private patched `codex` binary |
+| `CODEX_BRIDGE_EXTRA_DENY_EXEC_SUBPATHS` | macOS only: append additional colon-delimited absolute subpaths to the default browser deny-exec list |
 
 ## Boundaries
 

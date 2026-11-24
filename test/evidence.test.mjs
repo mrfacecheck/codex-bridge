@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import {
-	resolveCodexBinary, buildSafeEnv, buildCodexEnv, buildGitEnv, cmdOk, normalizeCwd, isGitRepo, resolveExecContext, lockKey, pidAlive,
+	resolveCodexBinary, buildSafeEnv, buildCodexEnv, buildDarwinDenyExecSubpaths, CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV,
+	buildGitEnv, cmdOk, normalizeCwd, isGitRepo, resolveExecContext, lockKey, pidAlive,
 	readLock, writeAtomic, lockAlive, acquireWriteLock, checkWriteLockConflict,
 	getWorktreeStatus, getUntrackedStats,
 } from "../dist/evidence.js";
@@ -188,4 +189,31 @@ test("buildCodexEnv always includes a non-empty PATH", () => {
 	const env = buildCodexEnv();
 	assert.equal(typeof env.PATH, "string");
 	assert.ok(env.PATH.length > 0);
+	assert.equal(env[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV], undefined);
+	if (process.platform === "darwin") {
+		const wsEnv = buildCodexEnv({ sandbox: "workspace-write" });
+		assert.match(wsEnv[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV] ?? "", /\/Applications\/Google Chrome\.app/);
+		assert.match(wsEnv[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV] ?? "", /ms-playwright/);
+		const dangerEnv = buildCodexEnv({ sandbox: "danger-full-access" });
+		assert.equal(dangerEnv[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV], undefined);
+	}
+});
+
+test("resolveCodexBinary prefers ~/.codex-bridge/bin/codex over ~/.local/bin/codex while CODEX_BINARY still overrides", () => {
+	const fakeHome = tmp("cb-ev-privhome-");
+	const localBin = join(fakeHome, ".local", "bin");
+	const privBin = join(fakeHome, ".codex-bridge", "bin");
+	mkdirSync(localBin, { recursive: true });
+	mkdirSync(privBin, { recursive: true });
+	const localCodex = join(localBin, "codex");
+	const privCodex = join(privBin, "codex");
+	const envCodex = join(fakeHome, "env-codex");
+	for (const f of [localCodex, privCodex, envCodex]) {
+		writeFileSync(f, "#!/bin/sh\n"); chmodSync(f, 0o755);
+	}
+	assert.equal(resolveCodexBinary({ PATH: "" }, fakeHome), privCodex);
+	assert.equal(resolveCodexBinary({ CODEX_BINARY: envCodex, PATH: "" }, fakeHome), envCodex);
+	const custom = buildDarwinDenyExecSubpaths(fakeHome, { CODEX_BRIDGE_EXTRA_DENY_EXEC_SUBPATHS: "/opt/Custom.app:relative/ignored" });
+	assert.match(custom, /\/opt\/Custom\.app/);
+	assert.doesNotMatch(custom, /relative\/ignored/);
 });

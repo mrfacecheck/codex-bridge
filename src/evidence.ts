@@ -36,9 +36,43 @@ function isExecutableFile(p: string): boolean {
   }
 }
 
+export const CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV = "CODEX_BRIDGE_DENY_EXEC_SUBPATHS";
+
+export function buildDarwinDenyExecSubpaths(
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const explicit = env[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV]?.trim();
+  if (explicit) return explicit;
+  const defaults = [
+    "/Applications/Google Chrome.app",
+    "/Applications/Google Chrome Canary.app",
+    "/Applications/Google Chrome Beta.app",
+    "/Applications/Google Chrome Dev.app",
+    "/Applications/Chromium.app",
+    "/Applications/Brave Browser.app",
+    "/Applications/Microsoft Edge.app",
+    "/Applications/Safari.app",
+    "/Applications/Firefox.app",
+    "/Applications/Firefox Developer Edition.app",
+    "/Applications/Arc.app",
+    "/Applications/Dia.app",
+    "/Applications/Comet.app",
+    path.join(home, "Applications", "Google Chrome.app"),
+    path.join(home, "Library", "Caches", "ms-playwright"),
+    path.join(home, ".cache", "puppeteer"),
+  ];
+  const extras = (env.CODEX_BRIDGE_EXTRA_DENY_EXEC_SUBPATHS ?? "")
+    .split(path.delimiter)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 1 && path.isAbsolute(p));
+  return [...new Set([...defaults, ...extras])].join(path.delimiter);
+}
+
 export function resolveCodexBinary(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
   if (env.CODEX_BINARY && existsSync(env.CODEX_BINARY)) return env.CODEX_BINARY;
   const candidates = [
+    path.join(home, ".codex-bridge", "bin", "codex"),
     "/Applications/Codex.app/Contents/Resources/codex",
     path.join(home, ".local", "bin", "codex"),
     path.join(home, ".codex", "packages", "standalone", "current", "bin", "codex"),
@@ -81,7 +115,7 @@ function prependPathDirs(currentPath: string, dirs: string[]): string {
   }
   return [...additions, ...parts].join(path.delimiter);
 }
-export function buildCodexEnv(): NodeJS.ProcessEnv {
+export function buildCodexEnv(opts?: { sandbox?: string }): NodeJS.ProcessEnv {
   const e = buildSafeEnv(SAFE_ENV);
   const extraDirs: string[] = [];
   if (path.isAbsolute(CODEX_BINARY)) extraDirs.push(path.dirname(CODEX_BINARY));
@@ -104,6 +138,11 @@ export function buildCodexEnv(): NodeJS.ProcessEnv {
   if (noProxy) {
     e.NO_PROXY ||= noProxy;
     e.no_proxy ||= noProxy;
+  }
+  if (process.platform === "darwin" && opts?.sandbox && opts.sandbox !== "danger-full-access") {
+    e[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV] = buildDarwinDenyExecSubpaths();
+  } else {
+    delete e[CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV];
   }
   return e;
 }

@@ -563,10 +563,11 @@ function runCodexWorker(params: WorkerCodexParams): Promise<WorkerCodexResult> {
   const stdoutFd = openSync(stdoutPath, "a", 0o600);
   const stderrFd = openSync(stderrPath, "a", 0o600);
 
+  const codexEnv = buildCodexEnv({ sandbox: meta.sandbox });
   const proc = spawn(CODEX_BINARY, args, {
     cwd,
     stdio: ["pipe", stdoutFd, stderrFd],
-    env: mcpHome ? { ...buildCodexEnv(), CODEX_HOME: mcpHome } : buildCodexEnv(),
+    env: mcpHome ? { ...codexEnv, CODEX_HOME: mcpHome } : codexEnv,
     detached: process.platform !== "win32",
   });
   try { closeSync(stdoutFd); } catch {}
@@ -780,17 +781,18 @@ function runCodexWorker(params: WorkerCodexParams): Promise<WorkerCodexResult> {
               if (failedExit) {
                 const aggOut = typeof it.aggregated_output === "string" ? it.aggregated_output : "";
                 const combinedBrowserText = `${cl}\n${aggOut}`;
-                const mentionsDarwinGuiBrowser = /\/Applications\/[^"'`\s]*\.app|Google Chrome|Brave Browser|Microsoft Edge|Safari\.app|Chromium\.app|HOST_VISUAL_QA_REQUIRED/i.test(combinedBrowserText);
-                const hasAbortFingerprint = it.exit_code === 134 || /\bSIGABRT\b|Abort trap: 6|_RegisterApplication/i.test(aggOut);
+                const mentionsDarwinGuiBrowser = /\/Applications\/[^"'`\s]*\.app|Google Chrome|Brave Browser|Microsoft Edge|Safari\.app|Chromium\.app|ms-playwright|\.cache\/puppeteer|HOST_VISUAL_QA_REQUIRED/i.test(combinedBrowserText);
+                const hasAbortOrExecDenyFingerprint = it.exit_code === 134
+                  || /\bSIGABRT\b|Abort trap: 6|_RegisterApplication|Operation not permitted|Permission denied|\bEPERM\b/i.test(aggOut);
                 const isDarwinGuiBrowserDenial = process.platform === "darwin"
                   && meta.sandbox !== "danger-full-access"
                   && mentionsDarwinGuiBrowser
-                  && (hasAbortFingerprint || aggOut.includes("HOST_VISUAL_QA_REQUIRED"));
+                  && (hasAbortOrExecDenyFingerprint || aggOut.includes("HOST_VISUAL_QA_REQUIRED"));
                 if (isDarwinGuiBrowserDenial && !repeatedFailRaisedFor.has("sandbox_gui_crash")) {
                   repeatedFailRaisedFor.add("sandbox_gui_crash");
                   raiseAttention(
                     "sandbox_gui_crash",
-                    `HOST_VISUAL_QA_REQUIRED (non-retryable): macOS sandboxed worker cannot run GUI browsers (exit ${it.exit_code}): ${cl.slice(0, 160)}`,
+                    `HOST_VISUAL_QA_REQUIRED (non-retryable): macOS sandboxed worker cannot execute GUI browsers (exit ${it.exit_code}): ${cl.slice(0, 160)}`,
                   );
                 }
                 const fp = `${cl}:${it.exit_code}`;

@@ -18,7 +18,7 @@ import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
-import { CODEX_BINARY, CODEX_BINARY_REALPATH, buildCodexEnv } from "./evidence.js";
+import { CODEX_BINARY, CODEX_BINARY_REALPATH, CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV, buildCodexEnv } from "./evidence.js";
 
 export interface McpServerInfo { name: string; enabled: boolean; env: Record<string, unknown>; envVars: string[]; hasHttpSecrets: boolean }
 export interface Grants { mcp: string[] }
@@ -88,9 +88,39 @@ export interface CliCapabilityProbe {
   binaryIdentity: string;
   version: string | null;
   mcpListSupported: boolean;
+  darwinExecDenyEnforced: boolean | null;
 }
 
 const capabilityProbeCache = new Map<string, CliCapabilityProbe>();
+
+function probeDarwinExecDeny(binary: string, baseEnv: NodeJS.ProcessEnv): boolean | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const probeEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      [CODEX_BRIDGE_DENY_EXEC_SUBPATHS_ENV]: "/bin/echo",
+    };
+    const denied = spawnSync(binary, ["sandbox", "--", "/bin/echo", "__cb_deny_probe__"], {
+      encoding: "utf8",
+      env: probeEnv,
+      timeout: 10_000,
+    });
+    const deniedOut = denied.stdout ?? "";
+    const deniedErr = denied.stderr ?? "";
+    const blocked = denied.status !== 0
+      && !deniedOut.includes("__cb_deny_probe__")
+      && /Operation not permitted|Permission denied|EPERM/i.test(deniedErr);
+    if (!blocked) return false;
+    const control = spawnSync(binary, ["sandbox", "--", "/usr/bin/true"], {
+      encoding: "utf8",
+      env: probeEnv,
+      timeout: 10_000,
+    });
+    return control.status === 0;
+  } catch {
+    return false;
+  }
+}
 
 export function probeCodexCapabilities(): CliCapabilityProbe {
   const target = CODEX_BINARY_REALPATH || CODEX_BINARY;
@@ -110,8 +140,15 @@ export function probeCodexCapabilities(): CliCapabilityProbe {
     listMcpServers();
     mcpListSupported = true;
   } catch {}
+  const darwinExecDenyEnforced = probeDarwinExecDeny(CODEX_BINARY, env);
 
-  const probe: CliCapabilityProbe = { binary: CODEX_BINARY, binaryIdentity: identity, version, mcpListSupported };
+  const probe: CliCapabilityProbe = {
+    binary: CODEX_BINARY,
+    binaryIdentity: identity,
+    version,
+    mcpListSupported,
+    darwinExecDenyEnforced,
+  };
   capabilityProbeCache.set(identity, probe);
   return probe;
 }
