@@ -71,6 +71,13 @@ await sleep(DELAY);
 
 if (MODE === "hang") {
 	ev({ type: "turn.started" });
+	if (ctl.stderr_spam) {
+		setInterval(() => {
+			process.stderr.write("ERROR codex_models_manager::manager: failed to refresh available models: timeout\n");
+		}, Number(ctl.stderr_spam_ms ?? 250));
+	} else {
+		setInterval(() => {}, 60_000);
+	}
 	await new Promise(() => {});
 }
 
@@ -81,6 +88,24 @@ if (MODE === "fail") {
 	ev({ type: "error", message: "stub requested failure" });
 	ev({ type: "turn.failed", error: { message: "stub requested failure" } });
 	process.exit(1);
+}
+
+if (Number(ctl.steps) > 0) {
+	const stepDelay = Number(ctl.step_delay_ms ?? 200);
+	for (let i = 1; i <= Number(ctl.steps); i++) {
+		ev({ type: "item.started", item: { id: `step-${i}`, type: "command_execution", command: `step-${i}` } });
+		await sleep(stepDelay);
+		ev({ type: "item.completed", item: { id: `step-${i}`, type: "command_execution", command: `step-${i}`, exit_code: 0, status: "completed" } });
+	}
+}
+
+if (ctl.started_and_completed_cmd) {
+	ev({ type: "item.started", item: { id: "dup-1", type: "command_execution", command: "npm test -- --run" } });
+	await sleep(DELAY);
+	ev({ type: "item.completed", item: { id: "dup-1", type: "command_execution", command: "npm test -- --run", exit_code: 0, status: "completed" } });
+	ev({ type: "item.started", item: { id: "fail-cmd", type: "command_execution", command: "lint --check" } });
+	await sleep(DELAY);
+	ev({ type: "item.completed", item: { id: "fail-cmd", type: "command_execution", command: "lint --check", exit_code: 2, status: "completed" } });
 }
 
 if (MODE === "escape") {

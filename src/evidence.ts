@@ -423,10 +423,31 @@ export function collectDiff(cwd: string, before: TreeSnapshot, after: TreeSnapsh
   for (const a of aliases) spSet.add(a.path);
   const sp = [...spSet]; const excl = sp.length > 0 ? [".", ...sp.map((p) => `:(exclude,literal)${p}`)] : [];
   const allDisp = [...sensitiveFiles.map(sensitiveDisplayName), ...aliases.map(aliasDisplay)];
-  if (excl.length > 1) { gitDiffToFile(cwd, ["diff", "--no-ext-diff", ...DIFF_RENDER_ARGS, before.tree, after.tree, "--", ...excl], dp, env); writeFileSync(path.join(runDir, "sensitive-omitted.txt"), allDisp.join("\n") + "\n", { mode: 0o600 }); }
-  else { gitDiffToFile(cwd, ["diff", "--no-ext-diff", ...DIFF_RENDER_ARGS, before.tree, after.tree, "--"], dp, env); }
+  if (excl.length > 1) { gitDiffToFile(cwd, ["diff", "--binary", "--no-ext-diff", ...DIFF_RENDER_ARGS, before.tree, after.tree, "--", ...excl], dp, env); writeFileSync(path.join(runDir, "sensitive-omitted.txt"), allDisp.join("\n") + "\n", { mode: 0o600 }); }
+  else { gitDiffToFile(cwd, ["diff", "--binary", "--no-ext-diff", ...DIFF_RENDER_ARGS, before.tree, after.tree, "--"], dp, env); }
   const fullB = statSync(dp).size; const preview = buildSmartDiffPreview(cwd, before.tree, after.tree, files, dp, maxPreview, env, aliases);
   return { is_git_repo: true, changed: true, summary: summary || `${files.length} files changed`, files, diff_preview: preview.text, diff_preview_mode: preview.mode, diff_truncated: preview.truncated, diff_path: dp, full_diff_bytes: fullB, preexisting_dirty_files: preDirtyCount, risk_flags: buildRiskFlags(files, fullB, aliases, dp), sensitive_diff_omitted: allDisp.length > 0 ? allDisp : undefined };
+}
+
+export function exportWorktreePatch(worktreePath: string, outPath: string): { changed: boolean; files: DiffFile[]; sensitiveOmitted: string[] } {
+  const after = snapshotWorktreeTree(worktreePath);
+  try {
+    let headTree: string;
+    try { headTree = git(worktreePath, ["rev-parse", "HEAD^{tree}"]).trim(); }
+    catch { headTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"; }
+    if (headTree === after.tree) return { changed: false, files: [], sensitiveOmitted: [] };
+    const env = { GIT_ALTERNATE_OBJECT_DIRECTORIES: [getRepoObjectDir(worktreePath), after.objectDir].join(path.delimiter) };
+    const files = parseNameStatusZ(git(worktreePath, ["diff", "--no-ext-diff", "--name-status", "-z", ...DIFF_DETECT_ARGS, headTree, after.tree, "--"], env));
+    const fsA = snapshotFsSentinel(worktreePath).snapshot;
+    const aliases = detectAliases(worktreePath, files, {}, fsA);
+    const sensitiveFiles = files.filter(isSensitiveDiffFile);
+    const sensitiveOmitted = [...sensitiveFiles.map(sensitiveDisplayName), ...aliases.map(aliasDisplay)];
+    if (sensitiveOmitted.length > 0) return { changed: true, files, sensitiveOmitted };
+    gitDiffToFile(worktreePath, ["diff", "--binary", "--no-ext-diff", ...DIFF_RENDER_ARGS, headTree, after.tree, "--"], outPath, env);
+    return { changed: true, files, sensitiveOmitted: [] };
+  } finally {
+    cleanupSnapshots(after);
+  }
 }
 
 // ── Process ──────────────────────────────────────────────────────

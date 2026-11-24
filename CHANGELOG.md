@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.4.0
+
+First-principles reliability and ergonomics overhaul driven by telemetry from multi-file `gpt-6.2-sol` (`xhigh`) production runs.
+
+### Changed (Breaking-free Paradigm Shifts)
+- **No arbitrary wall-clock cutoff by default → Activity-based `idle_timeout` watchdog**:
+  - `codex_exec` and `codex_resume` no longer impose arbitrary 300s / 900s / 1200s wall-clock deadlines that killed healthy long-running reasoning turns seconds from completion.
+  - Runs are now governed by an activity-based **`idle_timeout`** watchdog (default `900s` = 15 min of zero real Codex JSONL stdout events, configurable via `idle_timeout` parameter or `CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT`, or disabled with `0`).
+  - Wall-clock **`timeout`** is now strictly opt-in (`null` by default; pass `timeout > 0` only when you explicitly want a hard wall cap).
+  - Review packets cleanly distinguish `idle_timeout_clean` / `idle_timeout_with_changes` (`failure_hint: "idle_timeout"`) vs `timeout_clean` / `timeout_with_changes` (`failure_hint: "wall_timeout"`), and expose both `timeout` and `idle_timeout`.
+- **Smart event-driven long-poll (`wait_for: "terminal"` default)**:
+  - `codex_sessions(action="get", wait_seconds=...)` now works uniformly across ALL views (`status`, `summary`, `diff`, `output`, `review`) and defaults to **`wait_for: "terminal"`** (wakes on completion/failure, worker crash, first transition into `stale`, or wait deadline — NOT on every intermediate progress tick).
+  - Eliminates noisy polling loops: callers can invoke `codex_sessions(action="get", run_id=..., view="summary", wait_seconds=240)` and receive the final compact summary in a single round-trip. Pass `wait_for: "progress"` with `since_seq` to stream live intermediate events.
+  - Raised `CODEX_BRIDGE_MAX_WAIT_SECONDS` env cap to `600` (default remains `240`).
+
+### Added
+- **First-class worktree harvest (`codex_sessions action="apply"`)**:
+  - Atomically previews (`dry_run: true`) or applies a completed worktree run's diff into the parent checkout via `git apply --check` + parent write lock + `git apply`, with optional `cleanup: true` for 1-call harvest + teardown.
+  - Supports multi-turn resumed worktree sessions automatically via `scope: "auto" | "worktree" | "run"` (`auto` exports cumulative `HEAD..worktree` patch with full sensitive-file/alias redaction for resumed runs, and uses `changes.patch` for single-turn runs).
+  - Fail-closed guards: refuses active runs, non-completed runs (unless `allow_partial: true`), confirmed `worktree_escape`, omitted sensitive files, or write-lock conflicts; conflict failures touch zero parent files.
+  - `changes.patch` now includes `--binary` so binary assets apply faithfully.
+- **Active worktree cleanup guard**: `codex_sessions(action="cleanup")` now refuses to remove a worktree while its worker is still active (stop the run first).
+- **Doctor & List metadata**: `doctor` reports `default_idle_timeout_seconds` and `default_wall_timeout_seconds`; `list` includes `isolation` and `worktree_exists`.
+
+### Fixed
+- **Zero stderr pollution in progress & liveness**: Codex CLI background stderr noise (e.g. `codex_models_manager::manager: failed to refresh available models`) is preserved in `codex.stderr.log` and `review.stderr`, but NO LONGER written into `progress.json` / `progress.jsonl`, so it never falsely resets `lastActivityAt` / `idle_timeout` or aborts long-polls. Internal bridge notices (stall warning, cancel, timeout) also preserve true `lastActivityAt`.
+- **True worktree escape attribution (zero parallel false positives)**: Under `workspace-write`, parent checkout edits performed concurrently by the coordinator no longer trigger false `WORKTREE ESCAPE` warnings — they are transparently noted in `concurrent_parent_changes`. Real escapes are still caught via Codex `file_change` path bounds (symlink-normalized), command targeting attribution (ignoring read-only inspections and benign `node_modules`/`.venv` symlinks), and conservative full detection under `danger-full-access`.
+- **Deduplicated command events**: `item.started` + `item.completed` pairs for `command_execution` / `shell_command` / `tool_call` no longer emit duplicate `Running:` entries in `progress.jsonl` or `events.commands`; non-zero exit codes surface explicitly as `Command exited <code>: ...`, while clean completions refresh `lastActivityAt` via `touchActivity()` without bumping `seq`.
+- **Worktree dependency guidance in Project Brief**: Isolated worktrees note that gitignored `node_modules`/`.venv` are not copied and must not be installed into the parent checkout.
+
 ## v2.3.7
 
 Multi-client MCP ergonomics, shadow `CODEX_HOME` fidelity, and worktree lifecycle fixes (Antigravity, Claude Code, and any standard Stdio MCP client).

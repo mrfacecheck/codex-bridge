@@ -43,6 +43,7 @@ export const ACTIVE_SESSION_SCAN_LIMIT = 100;
 export const PRIMARY_PREVIEW_FILE_LIMIT = 20;
 export const SECONDARY_PREVIEW_FILE_LIMIT = 5;
 export const LOW_VALUE_HEADER_LIMIT = 10;
+export const DEFAULT_IDLE_TIMEOUT = 900; // 15 min without real Codex JSONL activity
 
 // ── Status Model ─────────────────────────────────────────────────
 export const TERMINAL_STATUSES = ["completed", "failed", "timeout", "cancelled"] as const;
@@ -114,7 +115,8 @@ export interface RunMeta {
   sandbox: string;
   task: string;
   model?: string;
-  timeout: number;
+  timeout?: number | null;
+  idleTimeout?: number | null;
   sessionName: string;
   maxDiffChars: number;
   allowNonGit: boolean;
@@ -205,6 +207,10 @@ export interface ReviewPacketLike {
   isolation?: "inplace" | "worktree";
   worktree_path?: string;
   parent_git_root?: string;
+  timeout?: number | null;
+  idle_timeout?: number | null;
+  worktree_escape?: { paths: string[]; evidence: string[] };
+  concurrent_parent_changes?: { count: number; paths: string[] };
   resume_attached?: boolean;
   resume_context_verified?: boolean;
   requested_session_id?: string;

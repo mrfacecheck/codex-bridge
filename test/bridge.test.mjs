@@ -47,6 +47,8 @@ test("doctor reports healthy with stub codex", async () => {
 	assert.equal(r.bridge_home_writable, true);
 	assert.equal(typeof r.active_worktrees, "number");
 	assert.equal(r.max_wait_seconds, 240);
+	assert.equal(r.default_idle_timeout_seconds, 900);
+	assert.equal(r.default_wall_timeout_seconds, null);
 });
 
 test("codex_exec worktree: completes, isolates changes, parent stays clean", async () => {
@@ -358,4 +360,236 @@ test("CODEX_BRIDGE_MAX_WAIT_SECONDS caps doctor max_wait_seconds and poll sugges
 	} finally {
 		b.close();
 	}
+});
+
+test("idle_timeout kills genuinely silent run even under continuous stderr noise without polluting progress", async () => {
+	setStubControl({ mode: "hang", stderr_spam: true, stderr_spam_ms: 200 });
+	const r = await bridge.call("codex_exec", {
+		task: "silent hang with stderr noise",
+		cwd: repo,
+		isolation: "worktree",
+		idle_timeout: 2,
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	assert.equal(r.status, "timeout", JSON.stringify(r).slice(0, 600));
+	assert.equal(r.status_detail, "idle_timeout_clean");
+	assert.equal(r.failure_hint, "idle_timeout");
+	assert.equal(r.timeout, null, "wall timeout defaults to null (unlimited)");
+	assert.equal(r.idle_timeout, 2);
+	assert.match(r.stderr || "", /codex_models_manager/, "stderr is still captured in review.stderr");
+
+	const st = await bridge.call("codex_sessions", { action: "get", run_id: r.run_id, view: "status", since_seq: 0 });
+	const evMsgs = (st.progress_events ?? []).map((e) => e.message);
+	assert.equal(evMsgs.some((m) => /\[stderr\]|codex_models_manager/i.test(m)), false, `stderr must not pollute progress_events: ${JSON.stringify(evMsgs)}`);
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
+});
+
+test("active run with no wall timeout survives beyond idle_timeout when emitting JSONL events", async () => {
+	setStubControl({ mode: "success", steps: 4, step_delay_ms: 750, write: "ACTIVE.txt::still-going\n" });
+	const r = await bridge.call("codex_exec", {
+		task: "long active multi-step run",
+		cwd: repo,
+		isolation: "worktree",
+		idle_timeout: 2,
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	assert.equal(r.status, "completed", JSON.stringify(r).slice(0, 600));
+	assert.equal(r.timeout, null);
+	assert.equal(r.idle_timeout, 2);
+	assert.ok(r.duration_ms >= 2800, `expected duration >= 2800ms (> 2s idle_timeout), got ${r.duration_ms}ms`);
+	assert.ok(existsSync(join(r.worktree_path, "ACTIVE.txt")));
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
+});
+
+test("command_execution started+completed events are deduplicated and non-zero exits surface cleanly", async () => {
+	setStubControl({ mode: "success", started_and_completed_cmd: true, write: "DEDUP.txt::ok\n" });
+	const r = await bridge.call("codex_exec", {
+		task: "dedup command events",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	assert.equal(r.status, "completed", JSON.stringify(r).slice(0, 600));
+	const npmMatches = (r.events?.commands ?? []).filter((c) => c === "npm test -- --run");
+	assert.equal(npmMatches.length, 1, `expected command recorded once, got ${JSON.stringify(r.events?.commands)}`);
+	const st = await bridge.call("codex_sessions", { action: "get", run_id: r.run_id, view: "status", since_seq: 0 });
+	const msgs = (st.progress_events ?? []).map((e) => e.message);
+	assert.equal(msgs.filter((m) => m === "Running: npm test -- --run").length, 1, `expected one Running progress line: ${JSON.stringify(msgs)}`);
+	assert.ok(msgs.some((m) => m.includes("Command exited 2: lint --check")), `expected non-zero exit notice: ${JSON.stringify(msgs)}`);
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
+});
+
+test("parallel coordinator edit in parent repo does not trigger false-positive WORKTREE ESCAPE", async () => {
+	setStubControl({ mode: "success", steps: 3, step_delay_ms: 400, write: "WT_ONLY.txt::worker\n" });
+	const run = await bridge.call("codex_exec", {
+		task: "edit only worktree",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "async",
+	});
+	await waitFor(async () => {
+		const s = await bridge.call("codex_sessions", { action: "get", run_id: run.run_id, view: "status" });
+		return s.status === "running" && (s.progress?.seq ?? 0) >= 3;
+	});
+	const parentFile = join(repo, "PARENT_UI.txt");
+	writeFileSync(parentFile, "coordinator-edit\n");
+	try {
+		// Default wait_for="terminal" on view="summary" waits through intermediate ticks and returns summary in one call
+		const sum = await bridge.call("codex_sessions", {
+			action: "get",
+			run_id: run.run_id,
+			view: "summary",
+			wait_seconds: 15,
+		});
+		assert.equal(sum.status, "completed", JSON.stringify(sum).slice(0, 600));
+		assert.equal(sum.review_ready, true);
+		assert.equal(sum.worktree_escape, undefined, "parallel parent edit must not trigger worktree_escape");
+		const warnItems = sum.warnings?.items ?? [];
+		assert.equal(warnItems.some((w) => /WORKTREE ESCAPE/i.test(w)), false, `unexpected escape warning: ${JSON.stringify(warnItems)}`);
+		assert.ok(sum.concurrent_parent_changes?.paths?.includes("PARENT_UI.txt"), `expected concurrent_parent_changes: ${JSON.stringify(sum.concurrent_parent_changes)}`);
+	} finally {
+		rmSync(parentFile, { force: true });
+		await bridge.call("codex_sessions", { action: "cleanup", run_id: run.run_id });
+	}
+});
+
+test("smart long-poll: wait_for=progress wakes on intermediate tick, wait_for=terminal waits for summary", async () => {
+	setStubControl({ mode: "success", steps: 4, step_delay_ms: 400, write: "POLL.txt::ok\n" });
+	const run = await bridge.call("codex_exec", {
+		task: "multi-step poll test",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "async",
+	});
+	const tick = await bridge.call("codex_sessions", {
+		action: "get",
+		run_id: run.run_id,
+		view: "status",
+		wait_seconds: 10,
+		wait_for: "progress",
+		since_seq: 0,
+	});
+	assert.equal(tick.review_ready, false, "wait_for=progress should wake before run finishes");
+	const summary = await bridge.call("codex_sessions", {
+		action: "get",
+		run_id: run.run_id,
+		view: "summary",
+		wait_seconds: 15,
+	});
+	assert.equal(summary.review_ready, true, "default wait_for=terminal should wait until review is ready");
+	assert.equal(summary.status, "completed");
+	assert.ok(summary.git_diff?.files?.items?.some((f) => f.path === "POLL.txt"));
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: run.run_id });
+});
+
+test("action=apply supports dry_run, atomic apply+cleanup, multi-turn resume, conflict rejection, and active cleanup guard", async () => {
+	// 1. Single-turn dry_run + apply(cleanup=true)
+	setStubControl({ mode: "success", write: "HARVEST.txt::clean-land\n" });
+	const r1 = await bridge.call("codex_exec", {
+		task: "create harvest file",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	assert.equal(r1.status, "completed");
+	const dry = await bridge.call("codex_sessions", { action: "apply", run_id: r1.run_id, dry_run: true });
+	assert.equal(dry.applied, false);
+	assert.equal(dry.dry_run, true);
+	assert.equal(dry.check_ok, true);
+	assert.equal(existsSync(join(repo, "HARVEST.txt")), false, "dry_run must not modify parent repo");
+
+	const applied = await bridge.call("codex_sessions", { action: "apply", run_id: r1.run_id, cleanup: true });
+	assert.equal(applied.applied, true, JSON.stringify(applied));
+	assert.equal(applied.cleaned, true);
+	assert.equal(readFileSync(join(repo, "HARVEST.txt"), "utf8"), "clean-land\n");
+	assert.equal(existsSync(r1.worktree_path), false, "cleanup=true removed worktree");
+	rmSync(join(repo, "HARVEST.txt"), { force: true });
+
+	// 2. Conflict check fails atomically without modifying parent repo
+	setStubControl({ mode: "success", write: "CONFLICT.txt::from-worker\n" });
+	const rc = await bridge.call("codex_exec", {
+		task: "create conflicting file",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	writeFileSync(join(repo, "CONFLICT.txt"), "parent-original\n");
+	try {
+		const bad = await bridge.call("codex_sessions", { action: "apply", run_id: rc.run_id });
+		assert.equal(bad.applied, false);
+		assert.equal(bad.check_ok, false);
+		assert.equal(readFileSync(join(repo, "CONFLICT.txt"), "utf8"), "parent-original\n", "failed apply must leave parent untouched");
+	} finally {
+		rmSync(join(repo, "CONFLICT.txt"), { force: true });
+		await bridge.call("codex_sessions", { action: "cleanup", run_id: rc.run_id });
+	}
+
+	// 3. Multi-turn worktree resume apply harvests full cumulative diff (turn 1 + turn 2)
+	setStubControl({ mode: "success", write: "MULTI_1.txt::v1\n" });
+	const m1 = await bridge.call("codex_exec", {
+		task: "turn 1",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	setStubControl({ mode: "success", write: "MULTI_2.txt::v2\n" });
+	const m2 = await bridge.call("codex_resume", {
+		session_id: m1.session_id,
+		task: "turn 2",
+		cwd: repo,
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	const mApply = await bridge.call("codex_sessions", { action: "apply", run_id: m2.run_id, cleanup: true });
+	assert.equal(mApply.applied, true, JSON.stringify(mApply));
+	assert.equal(mApply.scope, "worktree", "resumed worktree run defaults to cumulative worktree scope");
+	assert.equal(mApply.cleaned, true);
+	assert.equal(readFileSync(join(repo, "MULTI_1.txt"), "utf8"), "v1\n", "turn 1 file landed");
+	assert.equal(readFileSync(join(repo, "MULTI_2.txt"), "utf8"), "v2\n", "turn 2 file landed");
+	rmSync(join(repo, "MULTI_1.txt"), { force: true });
+	rmSync(join(repo, "MULTI_2.txt"), { force: true });
+
+	// 4. Cleanup refuses to delete an active worktree until stopped
+	setStubControl({ mode: "hang" });
+	const active = await bridge.call("codex_exec", {
+		task: "hang while testing cleanup guard",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "async",
+	});
+	await waitFor(async () => {
+		const s = await bridge.call("codex_sessions", { action: "get", run_id: active.run_id, view: "status" });
+		return s.status === "running";
+	});
+	const blockedCleanup = await bridge.call("codex_sessions", { action: "cleanup", run_id: active.run_id });
+	assert.match(JSON.stringify(blockedCleanup), /Cannot cleanup worktree while run is active/i);
+	await bridge.call("codex_sessions", { action: "stop", run_id: active.run_id });
+	await bridge.call("codex_sessions", { action: "get", run_id: active.run_id, view: "status", wait_seconds: 15 });
+	const okCleanup = await bridge.call("codex_sessions", { action: "cleanup", run_id: active.run_id });
+	assert.equal(okCleanup.cleaned, true);
+});
+
+test("explicit opt-in wall timeout still caps active runs with wall_timeout hint", async () => {
+	setStubControl({ mode: "success", steps: 10, step_delay_ms: 500 });
+	const r = await bridge.call("codex_exec", {
+		task: "active run exceeding opt-in wall cap",
+		cwd: repo,
+		isolation: "worktree",
+		timeout: 2,
+		idle_timeout: 60,
+		execution_mode: "auto",
+		wait_budget_seconds: 15,
+	});
+	assert.equal(r.status, "timeout", JSON.stringify(r).slice(0, 600));
+	assert.equal(r.status_detail, "timeout_clean");
+	assert.equal(r.failure_hint, "wall_timeout");
+	assert.equal(r.timeout, 2);
+	assert.equal(r.idle_timeout, 60);
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
 });

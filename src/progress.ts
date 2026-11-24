@@ -115,6 +115,20 @@ export function readProgress(runDir: string): ProgressState | null {
   return readJson<ProgressState>(path.join(runDir, "progress.json"));
 }
 
+/** Update liveness timestamps in progress.json without incrementing seq or emitting a progress_events row. */
+export function touchActivity(runDir: string, elapsedMs?: number) {
+  const fp = path.join(runDir, "progress.json");
+  const existing = readJson<ProgressState>(fp);
+  if (!existing) return;
+  const now = new Date().toISOString();
+  writeJsonAtomic(fp, {
+    ...existing,
+    updatedAt: now,
+    lastActivityAt: now,
+    ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+  });
+}
+
 const PROGRESS_TAIL_BYTES = 128 * 1024; // read last 128KB to avoid full-file load
 
 export function readProgressEventsSince(runDir: string, sinceSeq: number = 0, limit: number = 20, mode: "after" | "recent" = "after"): ProgressState[] {

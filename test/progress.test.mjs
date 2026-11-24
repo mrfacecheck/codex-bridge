@@ -143,3 +143,17 @@ test("projectHash is stable for identical input and differs for different input"
   assert.equal(p.projectHash("/tmp/some/project"), a);
   assert.notEqual(p.projectHash("/tmp/other/project"), a);
 });
+
+test("touchActivity updates lastActivityAt and elapsedMs without incrementing seq or progress.jsonl", () => {
+  const { dir } = freshRun();
+  p.updateProgress(dir, { status: "running", message: "working", elapsedMs: 100 });
+  const before = p.readProgress(dir);
+  const eventsBefore = p.readProgressEventsSince(dir, 0, 20, "after");
+  p.touchActivity(dir, 550);
+  const after = p.readProgress(dir);
+  const eventsAfter = p.readProgressEventsSince(dir, 0, 20, "after");
+  assert.equal(after.seq, before.seq, "seq must not bump on touchActivity");
+  assert.equal(after.elapsedMs, 550, "elapsedMs updated");
+  assert.ok(after.lastActivityAt, "lastActivityAt set");
+  assert.equal(eventsAfter.length, eventsBefore.length, "progress.jsonl must not grow on touchActivity");
+});

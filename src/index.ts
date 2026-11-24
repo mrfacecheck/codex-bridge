@@ -7,10 +7,10 @@ import { randomUUID } from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { z } from "zod";
-import { isTerminal, RECENT_RUN_LOOKUP_LIMIT, ACTIVE_SESSION_SCAN_LIMIT, type RunMeta, type ProgressState, type RunHandle, type RunHandleStatus, type Session, type ReviewPacketLike, type TokenUsage } from "./types.js";
+import { isTerminal, DEFAULT_IDLE_TIMEOUT, RECENT_RUN_LOOKUP_LIMIT, ACTIVE_SESSION_SCAN_LIMIT, type RunMeta, type ProgressState, type RunHandle, type RunHandleStatus, type Session, type ReviewPacketLike, type TokenUsage } from "./types.js";
 import {
   CODEX_BINARY, CODEX_BINARY_REALPATH, buildCodexEnv, buildGitEnv, normalizeCwd, resolveExecContext,
-  checkWriteLockConflict, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun, pidDescendantOf,
+  acquireWriteLock, checkWriteLockConflict, exportWorktreePatch, cmdOk, cleanOldTmpDirs, pidAlive, killPidTree, pidLooksLikeCodexForRun, pidDescendantOf,
 } from "./evidence.js";
 import {
   createRunDir, writeRunMeta, readRunMeta, readProgress, readProgressEventsSince,
@@ -39,12 +39,31 @@ const DEFAULT_WAIT_BUDGET = 60;
 const MAX_WAIT_BUDGET = 240;
 const MAX_CLIENT_WAIT_SECONDS = (() => {
   const raw = Number(process.env.CODEX_BRIDGE_MAX_WAIT_SECONDS);
-  if (Number.isFinite(raw) && raw >= 10 && raw <= MAX_WAIT_BUDGET) return Math.floor(raw);
+  if (Number.isFinite(raw) && raw >= 10 && raw <= 600) return Math.floor(raw);
   return MAX_WAIT_BUDGET;
+})();
+const CONFIGURED_DEFAULT_IDLE_TIMEOUT: number | null = (() => {
+  const raw = process.env.CODEX_BRIDGE_DEFAULT_IDLE_TIMEOUT;
+  if (raw === undefined || raw === "") return DEFAULT_IDLE_TIMEOUT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_IDLE_TIMEOUT;
+  if (n === 0) return null;
+  return Math.min(7200, Math.max(10, Math.floor(n)));
 })();
 
 function clampWaitSeconds(requested: number): number {
   return Math.max(0, Math.min(requested, MAX_CLIENT_WAIT_SECONDS));
+}
+
+function resolveWallTimeout(requested?: number | null): number | null {
+  if (requested === undefined || requested === null || requested === 0) return null;
+  return requested;
+}
+
+function resolveIdleTimeout(requested?: number | null, inherited?: number | null): number | null {
+  if (requested !== undefined) return requested === null || requested === 0 ? null : requested;
+  if (inherited !== undefined) return inherited === null || inherited === 0 ? null : inherited;
+  return CONFIGURED_DEFAULT_IDLE_TIMEOUT;
 }
 
 function cleanupFailedRunSetup(runDir: string, gitRoot: string | null, worktreePath?: string) {
@@ -76,12 +95,6 @@ function countActiveWorktrees(): number {
   } catch {
     return 0;
   }
-}
-
-function defaultTimeoutFor(sandbox: string, mode: string): number {
-  if (sandbox === "read-only") return 300;
-  if (mode === "async") return 1200;
-  return 900;
 }
 
 // ── Network Probe ────────────────────────────────────────────────
@@ -298,7 +311,7 @@ function buildRunHandle(runId: string, meta: RunMeta, progress: ProgressState | 
 }
 
 // ── Project Brief ────────────────────────────────────────────────
-function buildProjectBrief(cwd: string, gitRoot: string | null): string | null {
+function buildProjectBrief(cwd: string, gitRoot: string | null, isWorktree = false): string | null {
   const root = gitRoot || cwd;
   const parts: string[] = [];
   parts.push(`- Git root: ${root}`);
@@ -319,6 +332,9 @@ function buildProjectBrief(cwd: string, gitRoot: string | null): string | null {
   else if (existsSync(path.join(root, "go.mod"))) parts.push("- Tech: Go");
   else if (existsSync(path.join(root, "Cargo.toml"))) parts.push("- Tech: Rust");
 
+  if (isWorktree) {
+    parts.push("- Isolated git worktree: gitignored dependencies (e.g. node_modules/.venv) are not copied here; do not install packages into or modify the parent checkout");
+  }
   parts.push("- Avoid: full filesystem scans, node_modules inspection");
   parts.push("- Do not start dev servers or network listeners unless explicitly requested");
   parts.push("- Do not read .agents/skills or unrelated agent instruction packs");
@@ -375,7 +391,8 @@ function statusView(runId: string, progress: ProgressState | null, review: Revie
     worktree_path: meta?.worktreePath,
     isolation: meta?.isolation,
     sandbox: meta?.sandbox,
-    timeout: meta?.timeout,
+    timeout: meta?.timeout ?? null,
+    idle_timeout: meta?.idleTimeout ?? null,
     model: meta?.resolvedModel ?? meta?.model ?? null,
     model_source: meta?.modelSource,
     effort: meta?.resolvedEffort ?? meta?.effort ?? null,
@@ -427,9 +444,13 @@ function compactReviewSummary(runId: string, review: ReviewPacketLike, maxChars:
     failure_hint: review.failure_hint, partial_changes: review.partial_changes,
     session_id: review.session_id, session_name: review.session_name,
     duration_ms: review.duration_ms,
+    timeout: review.timeout ?? null,
+    idle_timeout: review.idle_timeout ?? null,
     isolation: review.isolation,
     worktree_path: review.worktree_path,
     parent_git_root: review.parent_git_root,
+    ...(review.worktree_escape ? { worktree_escape: review.worktree_escape } : {}),
+    ...(review.concurrent_parent_changes ? { concurrent_parent_changes: review.concurrent_parent_changes } : {}),
     model: review.model, model_source: review.model_source,
     effort: review.effort, effort_source: review.effort_source,
     codex_version: review.codex_version,
@@ -473,13 +494,25 @@ function diffOnlyView(runId: string, review: ReviewPacketLike, maxChars: number)
   };
 }
 
-function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, timeoutMs: number): Promise<void> {
+function isProgressStale(progress: ProgressState | null): boolean {
+  if (!progress || isTerminal(progress.status)) return false;
+  const activityAt = progress.lastActivityAt || progress.updatedAt;
+  if (!activityAt) return false;
+  return Date.now() - new Date(activityAt).getTime() > STALL_THRESHOLD_MS;
+}
+
+function waitForProgressOrReview(
+  runDir: string,
+  sinceSeq: number | undefined,
+  timeoutMs: number,
+  waitFor: "terminal" | "progress" = "terminal",
+): Promise<void> {
   if (timeoutMs <= 0) return Promise.resolve();
   return new Promise<void>((resolve) => {
     const deadline = Date.now() + timeoutMs;
-    // Baseline: when no cursor is given, wake on any progress newer than the state at call time.
-    // Without this, first polls (no since_seq) could only be woken by review.json or the deadline.
-    const baseline = sinceSeq ?? readProgress(runDir)?.seq ?? 0;
+    const initialProgress = readProgress(runDir);
+    const baseline = sinceSeq ?? initialProgress?.seq ?? 0;
+    const staleAtStart = isProgressStale(initialProgress);
     let done = false;
     let watcher: ReturnType<typeof fsWatch> | undefined;
     let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
@@ -496,7 +529,9 @@ function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, t
       markWorkerDeadIfNeeded(runDir);
       if (readReviewPacket(runDir)) return true;
       const progress = readProgress(runDir);
-      if (progress && progress.seq > baseline) return true;
+      if (progress && isTerminal(progress.status)) return true;
+      if (waitFor === "progress" && progress && progress.seq > baseline) return true;
+      if (waitFor === "terminal" && !staleAtStart && isProgressStale(progress)) return true;
       return Date.now() >= deadline;
     };
 
@@ -518,7 +553,7 @@ function waitForProgressOrReview(runDir: string, sinceSeq: number | undefined, t
       watcher = fsWatch(runDir, { persistent: false }, (_event, filename) => {
         if (done || !filename) return;
         const f = String(filename);
-        if (f === "progress.json" || f === "review.json" || f.startsWith("progress.json.") || f.startsWith("review.json.")) {
+        if (f === "review.json" || f.startsWith("review.json.") || f === "progress.json" || f.startsWith("progress.json.")) {
           check();
         }
       });
@@ -540,10 +575,10 @@ const SERVER_INSTRUCTIONS = [
   "codex-bridge is a run-scoped MCP evidence layer for delegating execution to OpenAI Codex CLI.",
   "",
   "Recommended workflow:",
-  "1. Write tasks: prefer isolation='worktree' so the caller's checkout stays clean and parallel runs are safe. Clean up finished worktrees with codex_sessions(action='cleanup', run_id=...).",
-  "2. Long or multi-file tasks: use execution_mode='async' (detached worker survives disconnects) and poll codex_sessions(action='get', run_id=..., view='status', wait_seconds=60, since_seq=last_seq).",
-  "3. Context economy: use return_view='summary' on sync/auto calls or read view='summary' first after completion; fetch view='diff' or view='output' only on demand.",
-  "4. Follow-ups on the same task: use codex_resume with session_id (inherits worktree, effort, and shadow CODEX_HOME). Start an unrelated task with codex_exec.",
+  "1. Write tasks: prefer isolation='worktree' so the caller's checkout stays clean and parallel runs are safe. Preview or harvest finished worktree changes with codex_sessions(action='apply', run_id=..., dry_run=true|false, cleanup=true), or remove unused worktrees with action='cleanup'.",
+  "2. Long or multi-file tasks: runs have NO arbitrary wall-clock cutoff by default — they are protected by an activity-based idle_timeout (default 900s with zero Codex JSONL output; pass timeout only if you want a hard wall cap). Use execution_mode='async' and wait with codex_sessions(action='get', run_id=..., view='summary', wait_seconds=240) (defaults to wait_for='terminal', waking on completion/failure/stale instead of every intermediate tick).",
+  "3. Context economy: use return_view='summary' on sync/auto calls or read view='summary' first after completion; fetch view='diff' or view='output' only on demand. Pass wait_for='progress' with since_seq only when streaming live step ticks.",
+  "4. Follow-ups on the same task: use codex_resume with session_id (inherits worktree, effort, idle_timeout, and shadow CODEX_HOME). Start an unrelated task with codex_exec.",
   "5. Always provide self-contained task specs (Codex has no prior chat context); include acceptance and non_goals for clear verification.",
 ].join("\n");
 
@@ -555,12 +590,13 @@ const SB = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const EM = z.enum(["auto", "sync", "async"]);
 const RV = z.enum(["full", "summary"]);
 
-server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive-content filtering, and optional git worktree isolation. Use execution_mode='async' for multi-file/test work, and return_view='summary' for compact sync responses.", {
+server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive-content filtering, activity-based idle watchdog, and optional git worktree isolation. Use execution_mode='async' for multi-file/test work, and return_view='summary' for compact sync responses.", {
   task: z.string().min(1).describe("Self-contained task specification (Codex has no prior conversation context)."),
   cwd: z.string().describe("Absolute path to the target project/repository directory."),
   model: z.string().optional().describe("Optional Codex model override (defaults to user's Codex config)."),
   sandbox: SB.optional().default("workspace-write").describe("Codex sandbox mode: read-only, workspace-write (default), or danger-full-access."),
-  timeout: z.number().int().min(10).max(7200).optional().describe("Hard worker timeout in seconds (defaults: read-only=300, write=900, async=1200)."),
+  timeout: z.number().int().min(0).max(86400).optional().describe("Optional hard wall-clock timeout in seconds. Omit or set 0 for unlimited wall time governed by idle_timeout."),
+  idle_timeout: z.number().int().min(0).max(7200).optional().describe("Activity-based idle watchdog in seconds with zero real Codex JSONL stdout events (default 900; 0 disables)."),
   session_name: z.string().optional().describe("Optional human-readable label for this run/session."),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000).describe("Maximum characters in diff_preview."),
   allow_non_git: z.boolean().optional().default(false).describe("Allow running in a non-git directory (disables diff capture)."),
@@ -579,7 +615,8 @@ server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive
   return_view: RV.optional().default("full").describe("Response shape if the run completes within wait_budget_seconds: full (default) or summary (compact diff stats + tail)."),
 }, async (args) => {
   const { task, model, sandbox, session_name, max_diff_chars, allow_non_git, allow_large_untracked_snapshot, danger_ack, execution_mode, wait_budget_seconds, project_brief, isolation, base, effort, acceptance, non_goals, output_schema, grants_mcp, return_view } = args;
-  const timeout = args.timeout ?? defaultTimeoutFor(sandbox, execution_mode);
+  const timeout = resolveWallTimeout(args.timeout);
+  const idleTimeout = resolveIdleTimeout(args.idle_timeout);
 
   let cwd: string;
   try { cwd = normalizeCwd(args.cwd); } catch (e: any) { return toolError(e.message); }
@@ -613,7 +650,7 @@ server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive
 
   let finalTask = task;
   if (project_brief) {
-    const brief = buildProjectBrief(effectiveCwd, useWorktree ? effectiveCwd : (gitRepo ? gitRoot : null));
+    const brief = buildProjectBrief(effectiveCwd, useWorktree ? effectiveCwd : (gitRepo ? gitRoot : null), useWorktree);
     if (brief) finalTask = brief + task;
   }
   if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
@@ -634,7 +671,7 @@ server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive
 
   const meta: RunMeta = {
     runId, cwd: effectiveCwd, gitRoot: gitRepo ? gitRoot : null, sandbox, task: finalTask,
-    model, timeout, sessionName: session_name || `run-${runId.slice(0, 8)}`,
+    model, timeout, idleTimeout, sessionName: session_name || `run-${runId.slice(0, 8)}`,
     maxDiffChars: max_diff_chars, allowNonGit: allow_non_git,
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
     createdAt: new Date().toISOString(),
@@ -691,14 +728,15 @@ server.tool("codex_exec", "Start a Codex run with run-scoped git diff, sensitive
   return toolJson(buildRunHandle(runId, meta, progress));
 });
 
-server.tool("codex_resume", "Resume an existing Codex session for follow-up fixes or iterations. Preserves thread_id verification, worktree isolation, effort, and shadow CODEX_HOME.", {
+server.tool("codex_resume", "Resume an existing Codex session for follow-up fixes or iterations. Preserves thread_id verification, worktree isolation, effort, idle_timeout, and shadow CODEX_HOME.", {
   session_id: z.string().min(1).describe("Codex session_id (thread_id) from a prior codex_exec run."),
   task: z.string().min(1).describe("Follow-up instructions for the existing Codex session."),
   cwd: z.string().optional().describe("Optional working directory (must match the original session cwd or parent repo for worktree runs)."),
   sandbox: SB.optional().describe("Cannot override original session sandbox; omit unless matching."),
   model: z.string().optional().describe("Optional model override for this resumed turn."),
   effort: z.string().optional().describe("Optional reasoning effort override (inherits parent run effort if omitted)."),
-  timeout: z.number().int().min(10).max(7200).optional().describe("Hard worker timeout in seconds."),
+  timeout: z.number().int().min(0).max(86400).optional().describe("Optional hard wall-clock timeout in seconds (inherits parent run timeout if omitted; 0 disables)."),
+  idle_timeout: z.number().int().min(0).max(7200).optional().describe("Activity-based idle watchdog in seconds (inherits parent run idle_timeout if omitted; 0 disables)."),
   max_diff_chars: z.number().int().min(1000).max(200000).optional().default(30000).describe("Maximum characters in diff_preview."),
   allow_non_git: z.boolean().optional().default(false).describe("Allow running in a non-git directory."),
   allow_large_untracked_snapshot: z.boolean().optional().default(false).describe("Bypass the 256MB untracked-file safety check."),
@@ -764,7 +802,8 @@ server.tool("codex_resume", "Resume an existing Codex session for follow-up fixe
   const activeRun = findActiveRunForSession(rsid);
   if (activeRun) return toolError("Codex session already has an active run. Wait for it to finish or stop it before resuming.", { session_id: rsid, active_run_id: activeRun.runId, status: activeRun.status });
 
-  const timeout = args.timeout ?? defaultTimeoutFor(effectiveSandbox, execution_mode);
+  const timeout = args.timeout !== undefined ? resolveWallTimeout(args.timeout) : (parentMeta.timeout ?? null);
+  const idleTimeout = resolveIdleTimeout(args.idle_timeout, parentMeta.idleTimeout);
 
   const runId = randomUUID();
   const runDir = createRunDir(runId);
@@ -772,7 +811,7 @@ server.tool("codex_resume", "Resume an existing Codex session for follow-up fixe
 
   let finalTask = task;
   if (project_brief) {
-    const brief = buildProjectBrief(runCwd, isParentWorktree ? runCwd : (gitRepo ? gitRoot : null));
+    const brief = buildProjectBrief(runCwd, isParentWorktree ? runCwd : (gitRepo ? gitRoot : null), isParentWorktree);
     if (brief) finalTask = brief + task;
   }
   if (acceptance) finalTask += `\n\nAcceptance criteria (verify before finishing):\n${acceptance}`;
@@ -787,7 +826,7 @@ server.tool("codex_resume", "Resume an existing Codex session for follow-up fixe
 
   const meta: RunMeta = {
     runId, cwd: runCwd, gitRoot: gitRepo ? gitRoot : null, sandbox: effectiveSandbox,
-    task: finalTask, model: args.model, timeout,
+    task: finalTask, model: args.model, timeout, idleTimeout,
     sessionName: ex?.name || `resumed-${rsid.slice(0, 8)}`,
     maxDiffChars: max_diff_chars, allowNonGit: allow_non_git,
     allowLargeUntracked: allow_large_untracked_snapshot, dangerAck: danger_ack,
@@ -859,17 +898,22 @@ const RunIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 
 const VIEW = z.enum(["status", "summary", "review", "diff", "output"]);
 
-server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run doctor diagnostics. Poll view='status' with wait_seconds (long-poll) and read view='summary' before diff/review.", {
-  action: z.enum(["list", "get", "stop", "doctor", "cleanup"]).describe("list recent runs, get run status/summary/diff/output/review, stop an active run, doctor environment check, or cleanup a worktree."),
+server.tool("codex_sessions", "List, inspect, wait on, stop, apply/clean up worktrees, or run doctor diagnostics. Long-poll with wait_seconds and view='summary' (wait_for='terminal' default) to wait cleanly for completion in one call.", {
+  action: z.enum(["list", "get", "stop", "doctor", "cleanup", "apply"]).describe("list recent runs, get run status/summary/diff/output/review, stop an active run, doctor environment check, apply a completed worktree run's diff into the parent checkout, or cleanup a worktree."),
   session_id: z.string().optional().describe("Codex session_id (alternative to run_id for get/stop)."),
-  run_id: RunIdSchema.describe("UUID of a codex-bridge run (required for cleanup; preferred for get/stop)."),
+  run_id: RunIdSchema.describe("UUID of a codex-bridge run (required for cleanup/apply; preferred for get/stop)."),
   view: VIEW.optional().default("status").describe("For action='get': status (lightweight poll), summary (compact files/warnings/tail), diff, output, or review."),
   max_chars: z.number().int().min(1000).max(200000).optional().default(20000).describe("Character cap for diff/output/review views."),
-  wait_seconds: z.number().int().min(0).max(240).optional().default(0).describe("Event-driven long-poll duration in seconds for view='status' (clamped by CODEX_BRIDGE_MAX_WAIT_SECONDS)."),
+  wait_seconds: z.number().int().min(0).max(600).optional().default(0).describe("Event-driven long-poll duration in seconds for action='get' (works with any view; clamped by CODEX_BRIDGE_MAX_WAIT_SECONDS)."),
+  wait_for: z.enum(["terminal", "progress"]).optional().default("terminal").describe("For wait_seconds > 0: 'terminal' (default) waits until completion/failure/stale/deadline; 'progress' wakes on each new progress event."),
   verbose: z.boolean().optional().default(false).describe("Include git_root, sandbox, model, and progress message in action='list'."),
   since_seq: z.number().int().min(0).optional().describe("Return incremental progress_events with seq > since_seq."),
+  dry_run: z.boolean().optional().default(false).describe("For action='apply': run git apply --check without modifying the parent checkout."),
+  cleanup: z.boolean().optional().default(false).describe("For action='apply': remove the worktree automatically after a clean apply."),
+  allow_partial: z.boolean().optional().default(false).describe("For action='apply': allow applying partial changes from a non-completed run after manual inspection."),
+  scope: z.enum(["auto", "worktree", "run"]).optional().default("auto").describe("For action='apply': 'auto' (default) applies the full worktree diff from HEAD for multi-turn resumed sessions and changes.patch for single-turn runs; 'worktree' forces full worktree diff; 'run' forces this single turn's changes.patch."),
 }, async (args) => {
-  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, verbose, since_seq } = args;
+  const { action, session_id: sid, run_id: rid, view, max_chars, wait_seconds, wait_for, verbose, since_seq, dry_run, cleanup, allow_partial, scope } = args;
 
   if (action === "doctor") {
     const stats = durableStateStats();
@@ -891,6 +935,8 @@ server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run d
       bridge_home_writable: isBridgeHomeWritable(),
       active_worktrees: countActiveWorktrees(),
       max_wait_seconds: MAX_CLIENT_WAIT_SECONDS,
+      default_idle_timeout_seconds: CONFIGURED_DEFAULT_IDLE_TIMEOUT,
+      default_wall_timeout_seconds: null,
       env: { has_HOME: Boolean(process.env.HOME), has_CODEX_HOME: Boolean(process.env.CODEX_HOME), has_CODEX_BRIDGE_HOME: Boolean(process.env.CODEX_BRIDGE_HOME), has_OPENAI_API_KEY: Boolean(process.env.OPENAI_API_KEY), has_proxy: Boolean(process.env.HTTPS_PROXY || process.env.HTTP_PROXY) },
       network: { ...connectivity, probe: "direct_tcp", host: "api.openai.com", port: 443, note: "Direct TCP probe. Proxy/VPN/PAC environments may differ from actual Codex connectivity." },
       durable_state: { run_count: stats.runCount, session_pointers: stats.sessionPointerCount, disk_bytes: stats.totalBytes, disk_mb: Math.round(stats.totalBytes / 1024 / 1024 * 10) / 10, oldest_run: stats.oldestRun, cleanup_policy: "7 days, triggered on startup and hourly during use" },
@@ -910,6 +956,8 @@ server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run d
           session_name: r.meta.sessionName,
           status: (review?.status as string) || progress?.status || "unknown",
           cwd: r.meta.cwd,
+          isolation: r.meta.isolation,
+          ...(r.meta.worktreePath ? { worktree_exists: existsSync(r.meta.worktreePath) } : {}),
           created_at: r.meta.createdAt,
           session_id: progress?.sessionId || (review?.session_id as string),
         };
@@ -928,10 +976,10 @@ server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run d
 
   // ── GET ────────────────────────────────────────────────────────
   if (action === "get") {
-    if (rid) return getByRunId(rid, view, max_chars, wait_seconds, since_seq);
+    if (rid) return getByRunId(rid, view, max_chars, wait_seconds, since_seq, wait_for);
     if (sid) {
       const runId = findRunIdBySessionId(sid);
-      if (runId) return getByRunId(runId, view, max_chars, wait_seconds, since_seq);
+      if (runId) return getByRunId(runId, view, max_chars, wait_seconds, since_seq, wait_for);
       return toolError("Session not found. Pass cwd to codex_resume.", { session_id: sid });
     }
     return toolError("session_id or run_id required for get");
@@ -950,19 +998,13 @@ server.tool("codex_sessions", "List, inspect, stop, clean up worktrees, or run d
   // ── CLEANUP (worktree runs) ───────────────────────────────────
   if (action === "cleanup") {
     if (!rid) return toolError("run_id required for cleanup");
-    if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
-    const rd = getRunDir(rid);
-    const meta = readRunMeta(rd);
-    if (!meta?.worktreePath) return toolJson({ cleaned: false, reason: "Run did not use isolation=worktree." });
-    const base = meta.parentGitRoot ?? meta.gitRoot;
-    if (!existsSync(meta.worktreePath)) {
-      if (base && existsSync(base)) {
-        try { spawnSync("git", ["-C", base, "worktree", "prune"], { encoding: "utf8", env: buildGitEnv() }); } catch {}
-      }
-      return toolJson({ cleaned: true, worktree: meta.worktreePath, note: "Worktree already gone." });
-    }
-    const r = spawnSync("git", ["-C", base as string, "worktree", "remove", "--force", meta.worktreePath], { encoding: "utf8", env: buildGitEnv() });
-    return toolJson({ cleaned: r.status === 0, worktree: meta.worktreePath, stderr: (r.stderr || "").trim() || undefined });
+    return cleanupWorktreeByRunId(rid);
+  }
+
+  // ── APPLY (harvest worktree diff into parent checkout) ────────
+  if (action === "apply") {
+    if (!rid) return toolError("run_id required for apply");
+    return applyByRunId(rid, dry_run, cleanup, allow_partial, scope);
   }
 
   return toolError("Unknown action");
@@ -989,13 +1031,14 @@ async function getByRunId(
   maxChars: number = 20000,
   waitSeconds: number = 0,
   sinceSeq?: number,
+  waitFor: "terminal" | "progress" = "terminal",
 ) {
   const runDir = getRunDir(rid);
   if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
 
-  // Long-poll: wait for progress change or review completion
+  // Event-driven long-poll: waits until completion/failure/stale/deadline (or next tick if wait_for='progress')
   const effectiveWait = clampWaitSeconds(waitSeconds);
-  if (effectiveWait > 0) await waitForProgressOrReview(runDir, sinceSeq, effectiveWait * 1000);
+  if (effectiveWait > 0) await waitForProgressOrReview(runDir, sinceSeq, effectiveWait * 1000, waitFor);
 
   markWorkerDeadIfNeeded(runDir);
   const meta = readRunMeta(runDir);
@@ -1015,9 +1058,12 @@ async function getByRunId(
 
   // Other views need review to be ready
   if (!review) {
+    const progressEvents = sinceSeq !== undefined
+      ? readProgressEventsSince(runDir, sinceSeq, 20, "after")
+      : readProgressEventsSince(runDir, 0, 3, "recent");
     return toolJson({
-      ...statusView(rid, progress, review, meta),
-      message: "Review not ready. Use view='status' with wait_seconds to poll.",
+      ...statusView(rid, progress, review, meta, progressEvents),
+      message: "Run still in progress; retry action='get' with wait_seconds to wait for completion.",
     });
   }
 
@@ -1036,6 +1082,182 @@ async function getByRunId(
   }
 
   return toolJson(statusView(rid, progress, review, meta));
+}
+
+function removeWorktreeDir(meta: RunMeta): { cleaned: boolean; worktree: string; note?: string; stderr?: string } {
+  const wt = meta.worktreePath!;
+  const base = meta.parentGitRoot ?? meta.gitRoot;
+  if (!existsSync(wt)) {
+    if (base && existsSync(base)) {
+      try { spawnSync("git", ["-C", base, "worktree", "prune"], { encoding: "utf8", env: buildGitEnv() }); } catch {}
+    }
+    return { cleaned: true, worktree: wt, note: "Worktree already gone." };
+  }
+  const r = spawnSync("git", ["-C", base as string, "worktree", "remove", "--force", wt], { encoding: "utf8", env: buildGitEnv() });
+  return { cleaned: r.status === 0, worktree: wt, stderr: (r.stderr || "").trim() || undefined };
+}
+
+function cleanupWorktreeByRunId(rid: string) {
+  if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
+  const rd = getRunDir(rid);
+  markWorkerDeadIfNeeded(rd);
+  const meta = readRunMeta(rd);
+  if (!meta?.worktreePath) return toolJson({ cleaned: false, reason: "Run did not use isolation=worktree." });
+  const review = readReviewPacket(rd);
+  const progress = readProgress(rd);
+  if (!review && !isTerminal(progress?.status)) {
+    return toolError("Cannot cleanup worktree while run is active. Stop the run first.", {
+      run_id: rid, status: progress?.status ?? "unknown", worktree: meta.worktreePath,
+    });
+  }
+  return toolJson(removeWorktreeDir(meta));
+}
+
+function applyByRunId(rid: string, dryRun: boolean, shouldCleanup: boolean, allowPartial: boolean, scope: "auto" | "worktree" | "run" = "auto") {
+  if (!runDirExists(rid)) return toolError("Run not found.", { run_id: rid });
+  const rd = getRunDir(rid);
+  markWorkerDeadIfNeeded(rd);
+  const meta = readRunMeta(rd);
+  if (!meta || meta.isolation !== "worktree" || !meta.parentGitRoot) {
+    return toolError("action='apply' only supports isolation='worktree' runs.", { run_id: rid, isolation: meta?.isolation ?? "unknown" });
+  }
+  if (!existsSync(meta.parentGitRoot)) {
+    return toolError("Parent git repository no longer exists.", { run_id: rid, parent_git_root: meta.parentGitRoot });
+  }
+  const review = readReviewPacket(rd) as ReviewPacketLike | null;
+  const progress = readProgress(rd);
+  if (!review) {
+    return toolError("Cannot apply worktree run before completion.", { run_id: rid, status: progress?.status ?? "unknown" });
+  }
+  if (review.status !== "completed" && !allowPartial) {
+    return toolError("Refusing to apply changes from a non-completed run. Inspect diff first or pass allow_partial=true.", {
+      run_id: rid, status: review.status, status_detail: review.status_detail, partial_changes: review.partial_changes,
+    });
+  }
+  if (review.worktree_escape) {
+    return toolError("Refusing to apply: worktree escape was detected on this run. Inspect diff and parent checkout manually.", {
+      run_id: rid, worktree_escape: review.worktree_escape,
+    });
+  }
+
+  const effectiveScope: "worktree" | "run" = scope === "auto"
+    ? (meta.resumeSessionId ? "worktree" : "run")
+    : scope;
+
+  let patchPath: string;
+  let files: Array<{ status?: string; path: string; from?: string }> = [];
+
+  if (effectiveScope === "worktree") {
+    if (!meta.worktreePath || !existsSync(meta.worktreePath)) {
+      return toolError("Worktree no longer exists; pass scope='run' to apply only this turn's changes.patch.", {
+        run_id: rid, worktree_path: meta.worktreePath,
+      });
+    }
+    patchPath = path.join(rd, "worktree.patch");
+    let exported;
+    try {
+      exported = exportWorktreePatch(meta.worktreePath, patchPath);
+    } catch (e: any) {
+      return toolError(`Failed to generate worktree patch: ${e?.message ?? String(e)}`, { run_id: rid, worktree_path: meta.worktreePath });
+    }
+    if (!exported.changed) {
+      return toolJson({ applied: false, dry_run: dryRun, scope: effectiveScope, run_id: rid, reason: "No changes to apply." });
+    }
+    if (exported.sensitiveOmitted.length > 0) {
+      return toolError("Refusing to apply: worktree contains sensitive file changes. Inspect and apply manually.", {
+        run_id: rid, sensitive_diff_omitted: exported.sensitiveOmitted,
+      });
+    }
+    files = exported.files;
+  } else {
+    const gd = review.git_diff;
+    if (!gd || !gd.is_git_repo || !gd.changed) {
+      return toolJson({ applied: false, dry_run: dryRun, scope: effectiveScope, run_id: rid, reason: "No changes to apply." });
+    }
+    if (gd.sensitive_diff_omitted && gd.sensitive_diff_omitted.length > 0) {
+      return toolError("Refusing to apply: run omitted sensitive files from changes.patch. Inspect and apply manually.", {
+        run_id: rid, sensitive_diff_omitted: gd.sensitive_diff_omitted,
+      });
+    }
+    if (!gd.diff_path || !existsSync(gd.diff_path)) {
+      return toolError("Run patch file (changes.patch) is missing.", { run_id: rid, patch_path: gd.diff_path });
+    }
+    patchPath = gd.diff_path;
+    files = gd.files ?? [];
+  }
+
+  if (statSync(patchPath).size === 0) {
+    return toolJson({ applied: false, dry_run: dryRun, scope: effectiveScope, run_id: rid, reason: "Patch file is empty; nothing to apply." });
+  }
+
+  const conflict = checkWriteLockConflict(meta.parentGitRoot);
+  if (conflict) return toolError(conflict, { run_id: rid, parent_git_root: meta.parentGitRoot });
+
+  const gitEnv = buildGitEnv();
+  const check = spawnSync("git", ["-C", meta.parentGitRoot, "apply", "--check", patchPath], { encoding: "utf8", env: gitEnv });
+  if (check.status !== 0) {
+    return toolJson({
+      applied: false,
+      dry_run: dryRun,
+      scope: effectiveScope,
+      check_ok: false,
+      run_id: rid,
+      parent_git_root: meta.parentGitRoot,
+      patch_path: patchPath,
+      error: (check.stderr || check.stdout || "git apply --check failed").trim(),
+    });
+  }
+  if (dryRun) {
+    return toolJson({
+      applied: false,
+      dry_run: true,
+      scope: effectiveScope,
+      check_ok: true,
+      run_id: rid,
+      parent_git_root: meta.parentGitRoot,
+      files,
+      patch_path: patchPath,
+    });
+  }
+
+  let wl;
+  try {
+    wl = acquireWriteLock(meta.parentGitRoot, `apply-${rid}`);
+  } catch (e: any) {
+    return toolError(e?.message ?? String(e), { run_id: rid, parent_git_root: meta.parentGitRoot });
+  }
+  let applyRes;
+  try {
+    applyRes = spawnSync("git", ["-C", meta.parentGitRoot, "apply", patchPath], { encoding: "utf8", env: gitEnv });
+  } finally {
+    wl.release();
+  }
+  if (applyRes.status !== 0) {
+    return toolError(`git apply failed: ${(applyRes.stderr || applyRes.stdout || "unknown error").trim()}`, {
+      run_id: rid, parent_git_root: meta.parentGitRoot, patch_path: patchPath,
+    });
+  }
+
+  let cleanupRes: { cleaned: boolean; worktree: string; note?: string; stderr?: string } | undefined;
+  if (shouldCleanup && meta.worktreePath) {
+    cleanupRes = removeWorktreeDir(meta);
+  }
+  return toolJson({
+    applied: true,
+    dry_run: false,
+    scope: effectiveScope,
+    check_ok: true,
+    run_id: rid,
+    parent_git_root: meta.parentGitRoot,
+    files,
+    patch_path: patchPath,
+    ...(cleanupRes ? {
+      cleaned: cleanupRes.cleaned,
+      worktree: cleanupRes.worktree,
+      ...(cleanupRes.note ? { cleanup_note: cleanupRes.note } : {}),
+      ...(cleanupRes.stderr ? { cleanup_stderr: cleanupRes.stderr } : {}),
+    } : {}),
+  });
 }
 
 function stopByRunId(rid: string) {
