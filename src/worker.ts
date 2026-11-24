@@ -778,6 +778,21 @@ function runCodexWorker(params: WorkerCodexParams): Promise<WorkerCodexResult> {
 
               // Low-noise 1-shot repeated_failure attention (never auto-kills!)
               if (failedExit) {
+                const aggOut = typeof it.aggregated_output === "string" ? it.aggregated_output : "";
+                const combinedBrowserText = `${cl}\n${aggOut}`;
+                const mentionsDarwinGuiBrowser = /\/Applications\/[^"'`\s]*\.app|Google Chrome|Brave Browser|Microsoft Edge|Safari\.app|Chromium\.app|HOST_VISUAL_QA_REQUIRED/i.test(combinedBrowserText);
+                const hasAbortFingerprint = it.exit_code === 134 || /\bSIGABRT\b|Abort trap: 6|_RegisterApplication/i.test(aggOut);
+                const isDarwinGuiBrowserDenial = process.platform === "darwin"
+                  && meta.sandbox !== "danger-full-access"
+                  && mentionsDarwinGuiBrowser
+                  && (hasAbortFingerprint || aggOut.includes("HOST_VISUAL_QA_REQUIRED"));
+                if (isDarwinGuiBrowserDenial && !repeatedFailRaisedFor.has("sandbox_gui_crash")) {
+                  repeatedFailRaisedFor.add("sandbox_gui_crash");
+                  raiseAttention(
+                    "sandbox_gui_crash",
+                    `HOST_VISUAL_QA_REQUIRED (non-retryable): macOS sandboxed worker cannot run GUI browsers (exit ${it.exit_code}): ${cl.slice(0, 160)}`,
+                  );
+                }
                 const fp = `${cl}:${it.exit_code}`;
                 const cnt = (failureCounts.get(fp) ?? 0) + 1;
                 failureCounts.set(fp, cnt);

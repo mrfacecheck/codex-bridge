@@ -262,12 +262,66 @@ export function extractSafeCodexDefaults(configToml: string): {
 }
 
 /**
+ * macOS Seatbelt capability boundary rules (bridge-side P2 mitigation).
+ *
+ * Empirically verified on codex-cli 0.166.0:
+ * - Blocks `open -a` / `/usr/bin/open -a` and unquoted space-free binaries before CreateProcess.
+ * - Does NOT intercept shell-quoted paths with spaces (e.g. `"/Applications/Google Chrome.app/..."`)
+ *   or indirect `node`/`python` `spawn()` descendants; full 100% kernel enforcement requires
+ *   the P1 bridge-private `codex` build patching `seatbelt.rs` with `(deny process-exec (subpath ...))`.
+ */
+const DARWIN_BROWSER_DENY_BINARIES: readonly string[] = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+  "/Applications/Safari.app/Contents/MacOS/Safari",
+  "/Applications/Firefox.app/Contents/MacOS/firefox",
+  "/Applications/Arc.app/Contents/MacOS/Arc",
+];
+
+const DARWIN_BROWSER_RULE_JUSTIFICATION =
+  "HOST_VISUAL_QA_REQUIRED: macOS sandboxed codex-bridge workers do not provide browser execution. Do not retry with alternate flags or Node/Python spawn; report HOST_VISUAL_QA_REQUIRED with target URLs/viewports to the parent.";
+
+function buildDarwinNoBrowserRules(): string {
+  const lines = [
+    "# Managed by codex-bridge (macOS Seatbelt browser capability boundary).",
+    ...DARWIN_BROWSER_DENY_BINARIES.map(
+      (bin) => `prefix_rule(pattern=[${JSON.stringify(bin)}], decision="forbidden", justification=${JSON.stringify(DARWIN_BROWSER_RULE_JUSTIFICATION)})`,
+    ),
+    `prefix_rule(pattern=["open", "-a"], decision="forbidden", justification=${JSON.stringify(DARWIN_BROWSER_RULE_JUSTIFICATION)})`,
+    `prefix_rule(pattern=["/usr/bin/open", "-a"], decision="forbidden", justification=${JSON.stringify(DARWIN_BROWSER_RULE_JUSTIFICATION)})`,
+  ];
+  return lines.join("\n") + "\n";
+}
+
+export function ensureDarwinNoBrowserRules(codexHome: string | undefined, sandbox?: string): void {
+  if (!codexHome || process.platform !== "darwin" || sandbox === "danger-full-access") return;
+  try {
+    const rulesDir = path.join(codexHome, "rules");
+    mkdirSync(rulesDir, { recursive: true, mode: 0o700 });
+    const ruleFile = path.join(rulesDir, "darwin-no-browser.rules");
+    if (!existsSync(ruleFile)) {
+      writeFileSync(ruleFile, buildDarwinNoBrowserRules(), { mode: 0o444 });
+    }
+  } catch {
+    // Non-fatal if shadow home is already locked read-only
+  }
+}
+
+/**
  * Build a shadow CODEX_HOME under runDir containing ONLY the granted servers
  * plus safe model/provider execution defaults.
  * Returns { codexHome, probe }. Throws GrantRejection/Error before touching the
  * filesystem when gating fails; throws when the post-write probe leaks or drops.
  */
-export function resolveMcpHome(grants: Grants, runCwd: string, runDir: string): { codexHome: string; probe: { name: string; enabled: boolean }[] } {
+export function resolveMcpHome(
+  grants: Grants,
+  runCwd: string,
+  runDir: string,
+  opts?: { sandbox?: string },
+): { codexHome: string; probe: { name: string; enabled: boolean }[] } {
   gateGrantsStatic(grants);
   const home = realCodexHome();
   const realConfig = path.join(home, "config.toml");
@@ -296,6 +350,9 @@ export function resolveMcpHome(grants: Grants, runCwd: string, runDir: string): 
   sections.push(`[projects.${JSON.stringify(runCwd)}]\ntrust_level = "trusted"`);
   for (const n of grants.mcp) sections.push(blocks.get(n)!);
   writeFileSync(path.join(codexHome, "config.toml"), sections.join("\n\n") + "\n", { mode: 0o600 });
+
+  // macOS Seatbelt capability rules (lives in shadow mcp-home outside the worker's writable root).
+  ensureDarwinNoBrowserRules(codexHome, opts?.sandbox);
 
   const granted = new Set(grants.mcp);
   // Defense-in-depth: fail closed if the target repo carries a project-level .codex/config.toml

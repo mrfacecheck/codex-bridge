@@ -28,6 +28,7 @@ Verify `codex_version.ok`, `codex_auth.ok`, `git_version.ok`, `cli_probe.mcpList
 - **Attention-only default (no silent auto-kill)**: Both `timeout` and `idle_timeout` default to `null` (never auto-kill a healthy reasoning turn). By default, `idle_attention_seconds: 900` raises a 1-shot `attention` signal (and `repeated_failure` fires after 3 identical command failures) waking `wait_for="terminal"` so you decide whether to continue or `stop`. Pass explicit `idle_timeout` or `timeout` only when you want an unattended hard budget.
 - **Model & effort**: Omit `model` / `effort` by default so the shadow `CODEX_HOME` inherits `~/.codex/config.toml` defaults cleanly.
 - **Security (`grants_mcp`)**: Leave omitted (zero MCP surface by default; project `.codex/config.toml` injections are rejected fail-closed).
+- **macOS browser/screenshot tasks**: Never ask sandboxed Codex workers (`read-only` / `workspace-write`) to launch `/Applications/Google Chrome.app` (even `--headless`) or WebKit inside macOS Seatbelt — `HIServices._RegisterApplication()` aborts with `SIGABRT (134)` and floods the user's desktop with macOS crash dialogs. Run live browser QA via the host `browse` / browser tool outside Seatbelt instead.
 
 ### Execution Mode Matrix
 

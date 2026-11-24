@@ -54,7 +54,7 @@ export const HEARTBEAT_STALE_MS = 15_000;
 export type Phase = "accepted" | "preparing" | "running" | "sealing" | "terminal";
 export type Outcome = "succeeded" | "failed" | "cancelled" | "interrupted";
 export type Liveness = "alive" | "gone" | "unknown";
-export type AttentionCode = "idle_silence" | "repeated_failure" | "no_response" | "observer_gap";
+export type AttentionCode = "idle_silence" | "repeated_failure" | "no_response" | "observer_gap" | "sandbox_gui_crash";
 
 export interface AttentionState {
   code: AttentionCode;

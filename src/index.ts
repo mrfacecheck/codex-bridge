@@ -38,7 +38,7 @@ import {
   requestCancel, reconcileRunAsync, reconcileRunSync, assertRunId,
   updateProgress as updateProgressFile, getLatestRunForSession, durableStateStats,
 } from "./progress.js";
-import { GrantRejection, normalizeGrants, resolveMcpHome, probeCodexCapabilities } from "./grants.js";
+import { GrantRejection, normalizeGrants, resolveMcpHome, ensureDarwinNoBrowserRules, probeCodexCapabilities } from "./grants.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -373,6 +373,17 @@ function buildProjectBrief(cwd: string, gitRoot: string | null, isIsolated = fal
 
   if (parts.length <= 2) return null;
   return `Project context:\n${parts.join("\n")}\n---\n`;
+}
+
+function buildDarwinSandboxConstraint(sandbox: string): string | null {
+  if (process.platform !== "darwin" || sandbox === "danger-full-access") return null;
+  return [
+    "macOS sandbox capability boundary (enforced by codex-bridge):",
+    "- This worker does NOT provide macOS browser execution or live screenshot capability (Seatbelt blocks HIServices/LaunchServices; launching .app browsers aborts with SIGABRT 134 and triggers desktop crash dialogs).",
+    "- Complete code changes, builds, and non-browser tests normally.",
+    "- When real visual/browser verification is needed, report HOST_VISUAL_QA_REQUIRED with the target URLs, viewports, and checklist so the parent/host runs it outside the sandbox.",
+    "- Browser execution denials are non-retryable: NEVER retry with alternate flags (--headless=new, --no-sandbox, --disable-gpu), alternate runtimes (Node/Python child_process spawn), or by downloading/installing browsers.",
+  ].join("\n");
 }
 
 // ── View Helpers ─────────────────────────────────────────────────
@@ -756,12 +767,14 @@ server.tool("codex_exec", "Start a Codex run with isolated snapshot repository +
   if (useIsolatedSnapshot && workspaceMeta) {
     finalTask += `\n\nConstraints: your ONLY writable directory is ${workspaceMeta.srcDir}. The checkout at ${gitRoot} is read-only context — do not create, modify, or delete files there or anywhere outside your isolated workspace. Do not push.`;
   }
+  const darwinConstraint = buildDarwinSandboxConstraint(sandbox);
+  if (darwinConstraint) finalTask += `\n\n${darwinConstraint}`;
 
   // Provision shadow CODEX_HOME (lives inside workspaceDir for isolated runs so old-run GC never breaks resume!)
   let mcpHome: string | undefined;
   try {
     const mcpParentDir = workspaceMeta ? workspaceDir(workspaceMeta.workspaceId) : runDir;
-    mcpHome = resolveMcpHome(normalizeGrants({ mcp: grants_mcp ?? [] }), effectiveCwd, mcpParentDir).codexHome;
+    mcpHome = resolveMcpHome(normalizeGrants({ mcp: grants_mcp ?? [] }), effectiveCwd, mcpParentDir, { sandbox }).codexHome;
   } catch (e: any) {
     cleanupFailedRunSetup(runDir, workspaceMeta?.workspaceId);
     releaseKeyIfSetupFails();
@@ -992,6 +1005,9 @@ server.tool("codex_resume", "Resume an existing Codex session for follow-up fixe
   if (isParentIsolated && parentGitRoot && isolatedSrcDir) {
     finalTask += `\n\nConstraints: your ONLY writable directory is ${isolatedSrcDir}. The checkout at ${parentGitRoot} is read-only context — do not create, modify, or delete files there or anywhere outside your isolated workspace. Do not push.`;
   }
+  const darwinResumeConstraint = buildDarwinSandboxConstraint(effectiveSandbox);
+  if (darwinResumeConstraint) finalTask += `\n\n${darwinResumeConstraint}`;
+  ensureDarwinNoBrowserRules(mcpHome, effectiveSandbox);
 
   const inheritedGrants = parentMeta?.grants ?? { mcp: [] };
   const effectiveEffort = args.effort ?? parentMeta?.effort;

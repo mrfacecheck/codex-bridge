@@ -561,3 +561,26 @@ test("chaos: session-rooted GC preserves resumable workspace runs and tombstones
 	assert.equal(existsSync(expDir), false, "expired unreferenced run swept");
 	assert.equal(state.claimIdempotency("exec", expKey, digest, { runId: randomUUID() }).kind, "tombstone", "expired run idempotency key turned into tombstone");
 });
+
+// ── 13. macOS Seatbelt browser capability boundary (Pro P0 + P2) ─────────────
+test("chaos: darwin sandboxed run provisions read-only browser deny rules and HOST_VISUAL_QA_REQUIRED contract", async () => {
+	setStubControl({ mode: "success", write: "DARWIN_GUARD.txt::ok\n" });
+	const r = await bridge.call("codex_exec", {
+		task: "normal workspace-write check",
+		cwd: repo,
+		isolation: "worktree",
+		execution_mode: "auto",
+		wait_budget_seconds: 20,
+	});
+	assert.equal(r.status, "completed");
+	const runMeta = progress.readRunMeta(progress.getRunDir(r.run_id));
+	if (process.platform === "darwin") {
+		assert.match(runMeta.task, /HOST_VISUAL_QA_REQUIRED/);
+		const ruleFile = join(runMeta.mcpHome, "rules", "darwin-no-browser.rules");
+		assert.equal(existsSync(ruleFile), true, "darwin-no-browser.rules must be provisioned inside shadow mcp-home");
+		const rulesText = readFileSync(ruleFile, "utf8");
+		assert.match(rulesText, /Google Chrome\.app\/Contents\/MacOS\/Google Chrome/);
+		assert.match(rulesText, /decision="forbidden"/);
+	}
+	await bridge.call("codex_sessions", { action: "cleanup", run_id: r.run_id });
+});
