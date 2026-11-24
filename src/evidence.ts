@@ -1,15 +1,16 @@
 import { spawnSync, execFileSync, type ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync,
-  realpathSync, readdirSync, openSync, closeSync, readSync, unlinkSync, renameSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, lstatSync,
+  realpathSync, readdirSync, readlinkSync, symlinkSync, copyFileSync, chmodSync,
+  openSync, closeSync, readSync, fsyncSync, unlinkSync, renameSync,
   accessSync, constants as fsConstants,
 } from "fs";
 import { homedir, tmpdir } from "os";
-import { createHash } from "crypto";
+import { createHash, randomBytes, randomUUID } from "crypto";
 import path from "path";
 import {
-  MAX_GIT_BUFFER, TRUNCATED_TAIL_MARKER, TRUNCATED_HEAD_MARKER,
+  MAX_GIT_BUFFER, TRUNCATED_TAIL_MARKER, TRUNCATED_HEAD_MARKER, EMPTY_TREE_OID,
   DIFF_DETECT_ARGS, DIFF_RENDER_ARGS, SENSITIVE_HASH_MAX, SENSITIVE_RE,
   SENSITIVE_PATHSPECS, LOW_VALUE_RE, KNOWN_JSONL_TYPES, SAFE_ENV,
   PRIMARY_PREVIEW_FILE_LIMIT, SECONDARY_PREVIEW_FILE_LIMIT, LOW_VALUE_HEADER_LIMIT,
@@ -17,7 +18,12 @@ import {
   type TreeSnapshot, type FsSentinelResult, type FileFingerprint, type FsSentinelSnapshot,
   type FsSentinelChange, type AliasReason, type SensitiveAlias, type DiffFile,
   type GitDiffResult, type NoGitResult, type EventSummary,
+  type WorkspaceMeta, type ApplyIntent, type ApplyIntentEntry, type FileObjectRef,
 } from "./types.js";
+import {
+  ensureDir, fsyncDirBestEffort, workspaceDir, writeWorkspaceMeta,
+  writeApplyIntent, resourceKey,
+} from "./state.js";
 
 // ── Codex Binary ──────────────────────────────────────────────────
 function isExecutableFile(p: string): boolean {
@@ -81,9 +87,6 @@ export function buildCodexEnv(): NodeJS.ProcessEnv {
   if (path.isAbsolute(CODEX_BINARY)) extraDirs.push(path.dirname(CODEX_BINARY));
   if (CODEX_BINARY_REALPATH) extraDirs.push(path.dirname(CODEX_BINARY_REALPATH));
   if (extraDirs.length && e.PATH) e.PATH = prependPathDirs(e.PATH, extraDirs);
-  // Mirror proxy env vars: derive missing variants from what's available.
-  // Codex CLI reads uppercase for its own API connection (HTTP CONNECT → WSS),
-  // Codex network-proxy reads both cases for sandbox child processes.
   const httpProxy = e.HTTP_PROXY || e.HTTPS_PROXY || e.http_proxy || e.https_proxy;
   if (httpProxy) {
     e.HTTP_PROXY  ||= httpProxy;
@@ -113,6 +116,26 @@ export function buildGitEnv(extra: Record<string, string> = {}): NodeJS.ProcessE
   return { ...e, ...extra };
 }
 
+function buildEvidenceGitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return buildGitEnv({
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "codex-bridge",
+    GIT_AUTHOR_EMAIL: "codex-bridge@local",
+    GIT_COMMITTER_NAME: "codex-bridge",
+    GIT_COMMITTER_EMAIL: "codex-bridge@local",
+    ...extra,
+  });
+}
+
+// Safe flags disabling hooks, textconv, external diff, and smudge/clean filters on private evidence store calls.
+const EVIDENCE_GIT_FLAGS = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.autocrlf=false",
+  "-c", "core.safecrlf=false",
+  "-c", "diff.external=",
+];
+
 // ── cwd / Git Root ───────────────────────────────────────────────
 export function normalizeCwd(input: string): string {
   if (!path.isAbsolute(input)) throw new Error(`cwd must be absolute: ${input}`);
@@ -123,11 +146,38 @@ export function normalizeCwd(input: string): string {
 export function git(cwd: string, args: string[], envExtra: Record<string, string> = {}): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: MAX_GIT_BUFFER, env: buildGitEnv(envExtra), stdio: ["ignore", "pipe", "pipe"] });
 }
+export function gitBare(gitDir: string, args: string[], opts?: { input?: string | Buffer; env?: Record<string, string> }): { status: number; stdout: string; stderr: string } {
+  const r = spawnSync("git", [...EVIDENCE_GIT_FLAGS, "--git-dir", gitDir, ...args], {
+    encoding: "utf8",
+    maxBuffer: MAX_GIT_BUFFER,
+    env: buildEvidenceGitEnv(opts?.env),
+    input: opts?.input,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  if (r.error) throw r.error;
+  return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+export function gitBareBuffer(gitDir: string, args: string[], envExtra: Record<string, string> = {}): Buffer {
+  const r = spawnSync("git", [...EVIDENCE_GIT_FLAGS, "--git-dir", gitDir, ...args], {
+    maxBuffer: MAX_GIT_BUFFER,
+    env: buildEvidenceGitEnv(envExtra),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (r.error) throw r.error;
+  if (r.status !== 0) {
+    throw new Error(`git ${args.slice(0, 3).join(" ")} failed (${r.status}): ${(r.stderr || "").toString("utf8").trim()}`);
+  }
+  return r.stdout as Buffer;
+}
 export function isGitRepo(cwd: string): boolean {
   try { return git(cwd, ["rev-parse", "--is-inside-work-tree"]).trim() === "true"; } catch { return false; }
 }
 export function getGitRoot(cwd: string): string {
   return normalizeCwd(git(cwd, ["rev-parse", "--show-toplevel"]).trim());
+}
+export function getGitDir(cwd: string): string {
+  const r = git(cwd, ["rev-parse", "--git-dir"]).trim();
+  return path.isAbsolute(r) ? r : path.resolve(cwd, r);
 }
 export function getRepoObjectDir(cwd: string): string {
   const r = git(cwd, ["rev-parse", "--git-path", "objects"]).trim();
@@ -138,7 +188,7 @@ export function resolveExecContext(cwd: string): ExecContext {
   return { runCwd: cwd, gitRoot: g ? getGitRoot(cwd) : cwd, gitRepo: g };
 }
 
-// ── Write Lock ───────────────────────────────────────────────────
+// ── Legacy Write Lock (preserved for inplace compat & unit tests) ─
 export function lockKey(cwd: string): string {
   return createHash("sha256").update(cwd).digest("hex").slice(0, 24);
 }
@@ -231,7 +281,261 @@ export function assertSnapshotSafe(cwd: string, maxMb: number, maxFiles = 20_000
   if (s.totalBytes > l) throw new Error(`Untracked files exceed ${maxMb}MB. Add to .gitignore or set allow_large_untracked_snapshot=true. Largest: ${s.largest.slice(0, 3).map((x) => `${x.path}(${Math.round(x.bytes / 1024 / 1024)}MB)`).join(", ")}`);
 }
 
-// ── Tree Snapshot ────────────────────────────────────────────────
+// ── v3 Out-of-Band Evidence Store & Independent Snapshot Repo ────
+export function initEvidenceStore(evidenceGitDir: string): void {
+  ensureDir(evidenceGitDir);
+  const init = gitBare(evidenceGitDir, ["init", "--bare", "-q"]);
+  if (init.status !== 0) throw new Error(`initEvidenceStore failed: ${init.stderr.trim()}`);
+  gitBare(evidenceGitDir, ["config", "core.fsync", "loose-object,pack,derived-metadata"]);
+  gitBare(evidenceGitDir, ["config", "core.fsyncMethod", "fsync"]);
+  gitBare(evidenceGitDir, ["config", "gc.auto", "0"]);
+}
+
+function walkPlainFiles(rootDir: string, prefix = ""): string[] {
+  const out: string[] = [];
+  const cur = prefix ? path.join(rootDir, prefix) : rootDir;
+  let entries;
+  try { entries = readdirSync(cur, { withFileTypes: true }); } catch { return out; }
+  for (const entry of entries) {
+    if (entry.name === ".git") continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...walkPlainFiles(rootDir, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+function enumerateCapturePaths(dir: string, extraForcePaths: string[] = []): string[] {
+  const pathSet = new Set<string>();
+  if (isGitRepo(dir)) {
+    const r = spawnSync("git", ["-C", dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+      encoding: "utf8", maxBuffer: MAX_GIT_BUFFER, env: buildGitEnv(), stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (r.status === 0 && r.stdout) {
+      for (const p of r.stdout.split("\0")) {
+        if (p && p !== ".git" && !p.startsWith(".git/")) pathSet.add(p);
+      }
+    } else {
+      for (const p of walkPlainFiles(dir)) pathSet.add(p);
+    }
+  } else {
+    for (const p of walkPlainFiles(dir)) pathSet.add(p);
+  }
+  // Never allow executor edits to .gitignore to make known origin source files vanish from evidence.
+  for (const p of extraForcePaths) {
+    if (!p || p === ".git" || p.startsWith(".git/")) continue;
+    try {
+      lstatSync(path.join(dir, p));
+      pathSet.add(p);
+    } catch {}
+  }
+  return [...pathSet].sort();
+}
+
+export function listTreePaths(evidenceGitDir: string, treeOid: string): string[] {
+  if (treeOid === EMPTY_TREE_OID) return [];
+  const r = gitBare(evidenceGitDir, ["ls-tree", "-r", "-z", "--name-only", treeOid]);
+  if (r.status !== 0) return [];
+  return r.stdout.split("\0").filter(Boolean);
+}
+
+/**
+ * Capture raw bytes of `srcDir` into the protected bare `evidenceGitDir` using `--no-filters`.
+ * Immune to executor git commits, resets, branch switches, `.gitattributes`, or `.gitignore` hiding origin files.
+ * Pins the captured tree under `pinRef` so GC cannot prune it.
+ */
+export function captureTreeIntoEvidence(
+  srcDir: string,
+  evidenceGitDir: string,
+  pinRef: string,
+  extraForcePaths: string[] = [],
+): string {
+  const relPaths = enumerateCapturePaths(srcDir, extraForcePaths);
+  const regularSimple: Array<{ rel: string; abs: string; mode: string }> = [];
+  const regularSpecial: Array<{ rel: string; abs: string; mode: string }> = [];
+  const symlinks: Array<{ rel: string; target: string }> = [];
+
+  for (const rel of relPaths) {
+    const abs = path.join(srcDir, rel);
+    let st;
+    try { st = lstatSync(abs); } catch { continue; }
+    if (st.isSymbolicLink()) {
+      symlinks.push({ rel, target: readlinkSync(abs) });
+    } else if (st.isFile()) {
+      const mode = (st.mode & 0o111) !== 0 ? "100755" : "100644";
+      if (abs.includes("\n") || abs.startsWith('"')) regularSpecial.push({ rel, abs, mode });
+      else regularSimple.push({ rel, abs, mode });
+    }
+  }
+
+  let treeOid = EMPTY_TREE_OID;
+  if (regularSimple.length > 0 || regularSpecial.length > 0 || symlinks.length > 0) {
+    const indexLines: string[] = [];
+
+    if (regularSimple.length > 0) {
+      const batch = gitBare(evidenceGitDir, ["hash-object", "-w", "--no-filters", "--stdin-paths"], {
+        input: regularSimple.map((f) => f.abs).join("\n") + "\n",
+      });
+      if (batch.status !== 0) throw new Error(`hash-object batch failed: ${batch.stderr.trim()}`);
+      const oids = batch.stdout.trim().split("\n").filter(Boolean);
+      if (oids.length !== regularSimple.length) {
+        throw new Error(`hash-object batch count mismatch: expected ${regularSimple.length}, got ${oids.length}`);
+      }
+      for (let i = 0; i < regularSimple.length; i++) {
+        indexLines.push(`${regularSimple[i].mode} ${oids[i]}\t${regularSimple[i].rel}\0`);
+      }
+    }
+
+    for (const f of regularSpecial) {
+      const h = gitBare(evidenceGitDir, ["hash-object", "-w", "--no-filters", "--", f.abs]);
+      if (h.status !== 0) throw new Error(`hash-object failed for ${f.rel}: ${h.stderr.trim()}`);
+      indexLines.push(`${f.mode} ${h.stdout.trim()}\t${f.rel}\0`);
+    }
+
+    for (const s of symlinks) {
+      const h = gitBare(evidenceGitDir, ["hash-object", "-w", "--stdin"], { input: s.target });
+      if (h.status !== 0) throw new Error(`hash-object symlink failed for ${s.rel}: ${h.stderr.trim()}`);
+      indexLines.push(`120000 ${h.stdout.trim()}\t${s.rel}\0`);
+    }
+
+    const tmpIdx = path.join(evidenceGitDir, `tmp-idx-${process.pid}-${randomBytes(4).toString("hex")}`);
+    try {
+      const u = gitBare(evidenceGitDir, ["update-index", "-z", "--index-info"], {
+        input: indexLines.join(""),
+        env: { GIT_INDEX_FILE: tmpIdx },
+      });
+      if (u.status !== 0) throw new Error(`update-index failed: ${u.stderr.trim()}`);
+      const wt = gitBare(evidenceGitDir, ["write-tree"], { env: { GIT_INDEX_FILE: tmpIdx } });
+      if (wt.status !== 0) throw new Error(`write-tree failed: ${wt.stderr.trim()}`);
+      treeOid = wt.stdout.trim();
+    } finally {
+      try { unlinkSync(tmpIdx); } catch {}
+    }
+  }
+
+  pinTreeInEvidence(evidenceGitDir, treeOid, pinRef);
+  return treeOid;
+}
+
+export function pinTreeInEvidence(evidenceGitDir: string, treeOid: string, pinRef: string): void {
+  const c = gitBare(evidenceGitDir, ["commit-tree", treeOid, "-m", pinRef]);
+  if (c.status !== 0) throw new Error(`commit-tree pin failed: ${c.stderr.trim()}`);
+  const commitOid = c.stdout.trim();
+  const u = gitBare(evidenceGitDir, ["update-ref", pinRef, commitOid]);
+  if (u.status !== 0) throw new Error(`update-ref pin failed: ${u.stderr.trim()}`);
+}
+
+function copyFileCowOrRegular(src: string, dst: string): void {
+  ensureDir(path.dirname(dst));
+  try {
+    copyFileSync(src, dst, fsConstants.COPYFILE_FICLONE);
+  } catch {
+    copyFileSync(src, dst);
+  }
+}
+
+/**
+ * Create an isolated standalone snapshot repository + out-of-band `evidence.git`.
+ * Zero shared `.git/refs`, zero shared `.git/config`, zero parent hooks/remotes/alternates.
+ * Supports `baseSpec = "working_tree"` (copies current dirty parent checkout excluding sensitive files)
+ * or any git ref (default `"HEAD"`).
+ */
+export function createSnapshotWorkspace(
+  parentGitRoot: string,
+  workspaceId: string,
+  baseSpec = "HEAD",
+): WorkspaceMeta {
+  const wsRoot = workspaceDir(workspaceId);
+  const srcDir = path.join(wsRoot, "src");
+  const evidenceGitDir = path.join(wsRoot, "evidence.git");
+  ensureDir(wsRoot);
+  ensureDir(srcDir);
+
+  const parentDirtyAtCreate = getWorktreeStatus(parentGitRoot).length > 0;
+  let originCommit: string | null = null;
+  try {
+    const refToResolve = baseSpec === "working_tree" ? "HEAD" : baseSpec;
+    originCommit = git(parentGitRoot, ["rev-parse", "--verify", `${refToResolve}^{commit}`]).trim();
+  } catch (e: any) {
+    if (baseSpec !== "working_tree") {
+      rmSync(wsRoot, { recursive: true, force: true });
+      throw new Error(`Invalid base ref '${baseSpec}': ${String(e?.message || e).trim()}`);
+    }
+  }
+
+  try {
+    if (baseSpec === "working_tree") {
+      const relPaths = enumerateCapturePaths(parentGitRoot);
+      for (const rel of relPaths) {
+        if (isSensitivePath(rel)) continue;
+        const src = path.join(parentGitRoot, rel);
+        const dst = path.join(srcDir, rel);
+        let st;
+        try { st = lstatSync(src); } catch { continue; }
+        if (st.isSymbolicLink()) {
+          ensureDir(path.dirname(dst));
+          symlinkSync(readlinkSync(src), dst);
+        } else if (st.isFile()) {
+          copyFileCowOrRegular(src, dst);
+          try { chmodSync(dst, (st.mode & 0o111) !== 0 ? 0o755 : 0o644); } catch {}
+        }
+      }
+    } else if (originCommit) {
+      const parentGitDir = getGitDir(parentGitRoot);
+      const tmpIdx = path.join(wsRoot, `checkout-idx-${process.pid}-${randomBytes(4).toString("hex")}`);
+      try {
+        const rt = spawnSync("git", ["-C", parentGitRoot, "read-tree", originCommit], {
+          encoding: "utf8",
+          env: buildGitEnv({ GIT_INDEX_FILE: tmpIdx }),
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        if (rt.status !== 0) throw new Error(`read-tree ${originCommit} failed: ${(rt.stderr || "").trim()}`);
+        const co = spawnSync("git", ["--git-dir", parentGitDir, "--work-tree", srcDir, "checkout-index", "-a", "-f"], {
+          encoding: "utf8",
+          env: buildGitEnv({ GIT_INDEX_FILE: tmpIdx }),
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        if (co.status !== 0) throw new Error(`checkout-index failed: ${(co.stderr || "").trim()}`);
+      } finally {
+        try { unlinkSync(tmpIdx); } catch {}
+      }
+    }
+
+    // Initialize standalone Git metadata inside srcDir so Codex's own `git status/diff` works cleanly.
+    git(srcDir, ["init", "-q"]);
+    git(srcDir, ["config", "user.email", "codex-bridge@local"]);
+    git(srcDir, ["config", "user.name", "codex-bridge"]);
+    git(srcDir, ["config", "commit.gpgsign", "false"]);
+    git(srcDir, ["config", "core.autocrlf", "false"]);
+    git(srcDir, ["add", "-A"]);
+    git(srcDir, ["commit", "-qm", "codex-bridge snapshot base", "--allow-empty"]);
+
+    // Initialize out-of-band durable evidence object store and seal immutable origin_tree.
+    initEvidenceStore(evidenceGitDir);
+    const originTree = captureTreeIntoEvidence(srcDir, evidenceGitDir, "refs/codex-bridge/origin");
+
+    const meta: WorkspaceMeta = {
+      workspaceId,
+      kind: "snapshot",
+      parentGitRoot,
+      srcDir: realpathSync(srcDir),
+      evidenceGitDir: realpathSync(evidenceGitDir),
+      baseSpec,
+      originCommit,
+      originTree,
+      parentDirtyAtCreate,
+      appliedWatermarks: {},
+      createdAt: new Date().toISOString(),
+    };
+    writeWorkspaceMeta(meta);
+    return meta;
+  } catch (e) {
+    try { rmSync(wsRoot, { recursive: true, force: true }); } catch {}
+    throw e;
+  }
+}
+
+// ── Tree Snapshot (in-place / legacy compat) ─────────────────────
 export function snapshotWorktreeTree(cwd: string): TreeSnapshot {
   const d = mkdtempSync(path.join(tmpdir(), "codex-bridge-tree-"));
   const ip = path.join(d, "index");
@@ -342,7 +646,7 @@ export function detectAliases(cwd: string, files: DiffFile[], fsB: FsSentinelSna
 }
 export function aliasDisplay(a: SensitiveAlias): string { return `${a.source} -> ${a.path} (${a.reason})`; }
 
-// ── Git Diff ─────────────────────────────────────────────────────
+// ── Git Diff (Worktree & Evidence Store) ─────────────────────────
 export function parseNameStatusZ(raw: string): DiffFile[] {
   const p = raw.split("\0").filter(Boolean); const f: DiffFile[] = [];
   for (let i = 0; i < p.length;) {
@@ -360,6 +664,16 @@ export function gitDiffToFile(cwd: string, args: string[], out: string, envExtra
     if (r.status !== 0) { const se = typeof r.stderr === "string" ? r.stderr.trim() : ""; throw new Error(`git ${args.slice(0, 3).join(" ")} failed (${r.status})${se ? `: ${se}` : ""}`); }
   } finally { closeSync(fd); }
 }
+function gitBareDiffToFile(evidenceGitDir: string, args: string[], out: string) {
+  const fd = openSync(out, "w", 0o600);
+  try {
+    const r = spawnSync("git", [...EVIDENCE_GIT_FLAGS, "--git-dir", evidenceGitDir, ...args], {
+      env: buildEvidenceGitEnv(), stdio: ["ignore", fd, "pipe"], encoding: "utf8", maxBuffer: 2 * 1024 * 1024,
+    });
+    if (r.error) throw r.error;
+    if (r.status !== 0) { const se = typeof r.stderr === "string" ? r.stderr.trim() : ""; throw new Error(`git ${args.slice(0, 3).join(" ")} failed (${r.status})${se ? `: ${se}` : ""}`); }
+  } finally { closeSync(fd); }
+}
 export function readUtf8Prefix(fp: string, max: number): string {
   const fd = openSync(fp, "r");
   try { const b = Buffer.alloc(max + 4); const n = readSync(fd, b, 0, b.length, 0); const d = new StringDecoder("utf8"); return d.write(b.subarray(0, n)) + d.end(); }
@@ -370,7 +684,13 @@ export function appendBounded(cur: string, add: string, max: number): { text: st
   const room = max - cur.length;
   return { text: cur + add.slice(0, room), full: add.length > room };
 }
-export function buildSmartDiffPreview(cwd: string, bT: string, aT: string, files: DiffFile[], diffPath: string, maxC: number, envExtra: Record<string, string> = {}, aliases: SensitiveAlias[] = []): { text: string; truncated: boolean; mode: "full" | "review-prioritized" } {
+function buildSmartPreviewCommon(
+  renderFileDiff: (f: DiffFile) => string,
+  files: DiffFile[],
+  diffPath: string,
+  maxC: number,
+  aliases: SensitiveAlias[] = [],
+): { text: string; truncated: boolean; mode: "full" | "review-prioritized" } {
   const fullB = statSync(diffPath).size;
   const aliasSet = new Set(aliases.map((a) => a.path));
   const isOmit = (f: DiffFile) => isSensitiveDiffFile(f) || aliasSet.has(f.path) || Boolean(f.from && aliasSet.has(f.from));
@@ -384,12 +704,18 @@ export function buildSmartDiffPreview(cwd: string, bT: string, aT: string, files
   let out = ""; let hit = false;
   function add(s: string) { const r = appendBounded(out, s, maxC); out = r.text; hit = hit || r.full; }
   add([`Diff is large (${fullB} bytes). Review-prioritized preview.`, `Full patch: ${diffPath}`, omitDisp.length ? `Sensitive (content omitted): ${omitDisp.join(", ")}` : "", secondary.length && primary.length ? `Low-value deprioritized: ${secondary.slice(0, LOW_VALUE_HEADER_LIMIT).map((f) => f.path).join(", ")}` : "", ""].filter(Boolean).join("\n"));
-  function addFile(f: DiffFile) { if (hit || isOmit(f)) return; add(`\n===== ${f.status} ${f.from ? `${f.from} → ` : ""}${f.path} =====\n`); if (hit) return; try { add(git(cwd, ["diff", "--no-ext-diff", ...DIFF_RENDER_ARGS, bT, aT, "--", ...(f.from ? [f.from, f.path] : [f.path])], envExtra) || "[no textual diff]\n"); } catch { add("[per-file diff unavailable]\n"); } }
+  function addFile(f: DiffFile) { if (hit || isOmit(f)) return; add(`\n===== ${f.status} ${f.from ? `${f.from} → ` : ""}${f.path} =====\n`); if (hit) return; try { add(renderFileDiff(f) || "[no textual diff]\n"); } catch { add("[per-file diff unavailable]\n"); } }
   for (const f of primary.slice(0, PRIMARY_PREVIEW_FILE_LIMIT)) addFile(f);
   if (primary.length === 0 && secondary.length > 0) { add("\nNo primary source diff. Showing low-value changes.\n"); for (const f of secondary.slice(0, SECONDARY_PREVIEW_FILE_LIMIT)) addFile(f); }
   if (primary.length === 0 && secondary.length === 0 && omitted.length > 0) add("\nOnly sensitive files changed. Content intentionally omitted.\n");
   const notice = `\n\n...(preview truncated; full patch: ${diffPath})`; if (hit) { if (out.length + notice.length <= maxC) out += notice; else out = out.slice(0, Math.max(0, maxC - notice.length)) + notice; }
   return { text: out, truncated: hit, mode: "review-prioritized" };
+}
+export function buildSmartDiffPreview(cwd: string, bT: string, aT: string, files: DiffFile[], diffPath: string, maxC: number, envExtra: Record<string, string> = {}, aliases: SensitiveAlias[] = []): { text: string; truncated: boolean; mode: "full" | "review-prioritized" } {
+  return buildSmartPreviewCommon(
+    (f) => git(cwd, ["diff", "--no-ext-diff", ...DIFF_RENDER_ARGS, bT, aT, "--", ...(f.from ? [f.from, f.path] : [f.path])], envExtra),
+    files, diffPath, maxC, aliases,
+  );
 }
 const SENSITIVE_REF_RE = /(["'`])(?:\.\/)?(?:\.env(?:\.[A-Za-z0-9_-]+)?|[A-Za-z0-9_-]+\.env(?:\.[A-Za-z0-9_-]+)?|\.npmrc|\.netrc|id_rsa|id_ed25519|[^"'`\s]+\.(pem|key|p12|pfx|crt))\1/g;
 
@@ -412,6 +738,7 @@ export function buildRiskFlags(files: DiffFile[], fullB: number, aliases: Sensit
   if (diffPath) { const refs = detectSensitivePathRefs(diffPath); if (refs.length) fl.push(`sensitive_path_references:${refs.slice(0, 5).join(",")}`); }
   return fl;
 }
+
 export function collectDiff(cwd: string, before: TreeSnapshot, after: TreeSnapshot, runDir: string, maxPreview: number, preDirtyCount: number, fsB: FsSentinelSnapshot = {}, fsA: FsSentinelSnapshot = {}): GitDiffResult {
   if (before.tree === after.tree) return { is_git_repo: true, changed: false, summary: "No changes detected", files: [], diff_preview: "", diff_preview_mode: "full", diff_truncated: false, full_diff_bytes: 0, preexisting_dirty_files: preDirtyCount, risk_flags: [] };
   const env = treeDiffEnv(cwd, before, after); const dp = path.join(runDir, "changes.patch");
@@ -429,12 +756,405 @@ export function collectDiff(cwd: string, before: TreeSnapshot, after: TreeSnapsh
   return { is_git_repo: true, changed: true, summary: summary || `${files.length} files changed`, files, diff_preview: preview.text, diff_preview_mode: preview.mode, diff_truncated: preview.truncated, diff_path: dp, full_diff_bytes: fullB, preexisting_dirty_files: preDirtyCount, risk_flags: buildRiskFlags(files, fullB, aliases, dp), sensitive_diff_omitted: allDisp.length > 0 ? allDisp : undefined };
 }
 
+/**
+ * Collect run diff directly from sealed trees inside the out-of-band `evidence.git`.
+ * Completely immune to executor git commit/reset/checkout inside `workDir`.
+ */
+export function collectEvidenceDiff(
+  evidenceGitDir: string,
+  workDir: string,
+  beforeTree: string,
+  afterTree: string,
+  runDir: string,
+  maxPreview: number,
+  preDirtyCount: number,
+  fsB: FsSentinelSnapshot = {},
+  fsA: FsSentinelSnapshot = {},
+): GitDiffResult {
+  if (beforeTree === afterTree) {
+    return { is_git_repo: true, changed: false, summary: "No changes detected", files: [], diff_preview: "", diff_preview_mode: "full", diff_truncated: false, full_diff_bytes: 0, preexisting_dirty_files: preDirtyCount, risk_flags: [] };
+  }
+  const dp = path.join(runDir, "changes.patch");
+  const statRes = gitBare(evidenceGitDir, ["diff-tree", "--no-ext-diff", "-r", "--stat", ...DIFF_RENDER_ARGS, beforeTree, afterTree, "--"]);
+  const summary = statRes.stdout.trim();
+  const nsRes = gitBare(evidenceGitDir, ["diff-tree", "--no-ext-diff", "-r", "--name-status", "-z", ...DIFF_DETECT_ARGS, beforeTree, afterTree, "--"]);
+  const files = parseNameStatusZ(nsRes.stdout);
+  const aliases = existsSync(workDir) ? detectAliases(workDir, files, fsB, fsA) : [];
+  const sensitiveFiles = files.filter(isSensitiveDiffFile);
+  const spSet = new Set<string>();
+  for (const f of sensitiveFiles) { if (f.from) spSet.add(f.from); spSet.add(f.path); }
+  for (const a of aliases) spSet.add(a.path);
+  const sp = [...spSet];
+  const excl = sp.length > 0 ? [".", ...sp.map((p) => `:(exclude,literal)${p}`)] : [];
+  const allDisp = [...sensitiveFiles.map(sensitiveDisplayName), ...aliases.map(aliasDisplay)];
+  if (excl.length > 1) {
+    gitBareDiffToFile(evidenceGitDir, ["diff-tree", "-p", "--binary", "--no-ext-diff", "-r", ...DIFF_RENDER_ARGS, beforeTree, afterTree, "--", ...excl], dp);
+    writeFileSync(path.join(runDir, "sensitive-omitted.txt"), allDisp.join("\n") + "\n", { mode: 0o600 });
+  } else {
+    gitBareDiffToFile(evidenceGitDir, ["diff-tree", "-p", "--binary", "--no-ext-diff", "-r", ...DIFF_RENDER_ARGS, beforeTree, afterTree, "--"], dp);
+  }
+  const fullB = statSync(dp).size;
+  const preview = buildSmartPreviewCommon(
+    (f) => gitBare(evidenceGitDir, ["diff-tree", "-p", "--no-ext-diff", "-r", ...DIFF_RENDER_ARGS, beforeTree, afterTree, "--", ...(f.from ? [f.from, f.path] : [f.path])]).stdout,
+    files, dp, maxPreview, aliases,
+  );
+  return {
+    is_git_repo: true, changed: true, summary: summary || `${files.length} files changed`,
+    files, diff_preview: preview.text, diff_preview_mode: preview.mode, diff_truncated: preview.truncated,
+    diff_path: dp, full_diff_bytes: fullB, preexisting_dirty_files: preDirtyCount,
+    risk_flags: buildRiskFlags(files, fullB, aliases, dp),
+    sensitive_diff_omitted: allDisp.length > 0 ? allDisp : undefined,
+  };
+}
+
+// ── v3 Private-Store 3-Way Merge (Git 2.38+ compatible) ──────────
+export type ThreeWayMergeResult =
+  | { ok: true; mergedTree: string }
+  | { ok: false; conflicts: string[]; message: string };
+
+export function computeThreeWayMerge(
+  evidenceGitDir: string,
+  baseTree: string,
+  oursTree: string,
+  theirsTree: string,
+): ThreeWayMergeResult {
+  if (baseTree === theirsTree) return { ok: true, mergedTree: oursTree };
+  if (baseTree === oursTree) return { ok: true, mergedTree: theirsTree };
+  if (oursTree === theirsTree) return { ok: true, mergedTree: oursTree };
+
+  const cb = gitBare(evidenceGitDir, ["commit-tree", baseTree, "-m", "merge-base"]);
+  if (cb.status !== 0) throw new Error(`commit-tree base failed: ${cb.stderr.trim()}`);
+  const cbOid = cb.stdout.trim();
+
+  const co = gitBare(evidenceGitDir, ["commit-tree", oursTree, "-p", cbOid, "-m", "merge-ours"]);
+  if (co.status !== 0) throw new Error(`commit-tree ours failed: ${co.stderr.trim()}`);
+  const coOid = co.stdout.trim();
+
+  const cr = gitBare(evidenceGitDir, ["commit-tree", theirsTree, "-p", cbOid, "-m", "merge-theirs"]);
+  if (cr.status !== 0) throw new Error(`commit-tree theirs failed: ${cr.stderr.trim()}`);
+  const crOid = cr.stdout.trim();
+
+  // Exit code is the SOLE arbiter: 0 = clean merge, 1 = conflict (parent untouched), other = error.
+  const m = gitBare(evidenceGitDir, ["merge-tree", "--write-tree", coOid, crOid]);
+  if (m.status === 0) {
+    const mergedTree = m.stdout.trim().split("\n")[0]?.trim();
+    if (!mergedTree || !/^[0-9a-f]{40}$/i.test(mergedTree)) {
+      throw new Error(`merge-tree returned invalid tree OID: ${JSON.stringify(m.stdout)}`);
+    }
+    return { ok: true, mergedTree };
+  }
+  if (m.status === 1) {
+    const conflicts = new Set<string>();
+    for (const line of m.stdout.split("\n")) {
+      const stageMatch = line.match(/^[0-7]{6} [0-9a-f]{40} [123]\t(.+)$/);
+      if (stageMatch) conflicts.add(stageMatch[1]);
+      const msgMatch = line.match(/^CONFLICT \([^)]+\): .*?\bin\s+(.+)$/);
+      if (msgMatch) conflicts.add(msgMatch[1].trim());
+    }
+    return {
+      ok: false,
+      conflicts: [...conflicts],
+      message: m.stdout.split("\n").filter((l) => l.startsWith("CONFLICT") || l.startsWith("Auto-merging")).join("\n") || "3-way merge conflict",
+    };
+  }
+  throw new Error(`git merge-tree failed (exit ${m.status}): ${(m.stderr || m.stdout).trim()}`);
+}
+
+// ── v3 Safe Delta Planning & Recoverable File Materialization ────
+interface TreeEntry { mode: number; type: string; oid: string; path: string }
+
+function parseLsTreeZ(evidenceGitDir: string, treeOid: string): Map<string, TreeEntry> {
+  const map = new Map<string, TreeEntry>();
+  if (treeOid === EMPTY_TREE_OID) return map;
+  const r = gitBare(evidenceGitDir, ["ls-tree", "-r", "-z", treeOid]);
+  if (r.status !== 0) throw new Error(`ls-tree ${treeOid} failed: ${r.stderr.trim()}`);
+  for (const rec of r.stdout.split("\0")) {
+    if (!rec) continue;
+    const tab = rec.indexOf("\t");
+    if (tab < 0) continue;
+    const header = rec.slice(0, tab).split(" ");
+    const p = rec.slice(tab + 1);
+    if (header.length < 3 || !p) continue;
+    map.set(p, { mode: parseInt(header[0], 8), type: header[1], oid: header[2], path: p });
+  }
+  return map;
+}
+
+const ALLOWED_FILE_MODES = new Set([0o100644, 0o100755]);
+
+function assertSafeRelativePath(rel: string): void {
+  if (!rel || rel.includes("\0") || path.isAbsolute(rel) || rel.startsWith("/") || rel.startsWith("\\")) {
+    throw new Error(`Unsafe target path rejected: ${JSON.stringify(rel)}`);
+  }
+  const parts = rel.split("/");
+  for (const seg of parts) {
+    if (!seg || seg === "." || seg === ".." || seg.toLowerCase() === ".git") {
+      throw new Error(`Unsafe path segment rejected in ${JSON.stringify(rel)}`);
+    }
+  }
+}
+
+function assertNoSymlinkEscape(targetDir: string, rel: string): void {
+  const parts = rel.split("/");
+  let cur = targetDir;
+  for (let i = 0; i < parts.length; i++) {
+    cur = path.join(cur, parts[i]);
+    let st;
+    try { st = lstatSync(cur); } catch { break; }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing to materialize through symlink: ${parts.slice(0, i + 1).join("/")}`);
+    }
+    if (i < parts.length - 1 && !st.isDirectory()) {
+      throw new Error(`Refusing file/directory type swap at ancestor: ${parts.slice(0, i + 1).join("/")}`);
+    }
+    if (i === parts.length - 1 && st.isDirectory()) {
+      throw new Error(`Refusing directory/file type swap at target: ${rel}`);
+    }
+  }
+}
+
+export function gitBlobOidOfFile(absPath: string): FileObjectRef | null {
+  let st;
+  try { st = lstatSync(absPath); } catch { return null; }
+  if (st.isSymbolicLink() || !st.isFile()) return null;
+  const buf = readFileSync(absPath);
+  const sha1 = createHash("sha1").update(`blob ${buf.length}\0`).update(buf).digest("hex");
+  const mode = (st.mode & 0o111) !== 0 ? 0o100755 : 0o100644;
+  return { blob: sha1, mode };
+}
+
+function refsMatch(a: FileObjectRef | null, b: FileObjectRef | null): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return a.blob === b.blob && a.mode === b.mode;
+}
+
+export interface MaterializationPlan {
+  entries: ApplyIntentEntry[];
+  files: DiffFile[];
+  sensitiveOmitted: string[];
+}
+
+export function planTreeMaterialization(
+  evidenceGitDir: string,
+  targetDir: string,
+  oursTree: string,
+  mergedTree: string,
+): MaterializationPlan {
+  const oursMap = parseLsTreeZ(evidenceGitDir, oursTree);
+  const mergedMap = parseLsTreeZ(evidenceGitDir, mergedTree);
+  const allPaths = [...new Set([...oursMap.keys(), ...mergedMap.keys()])].sort();
+
+  const entries: ApplyIntentEntry[] = [];
+  const files: DiffFile[] = [];
+  const sensitiveOmitted: string[] = [];
+  const lowerSeen = new Map<string, string>();
+
+  // Check case-folding collisions across all target paths
+  for (const p of mergedMap.keys()) {
+    const low = p.toLowerCase();
+    const prev = lowerSeen.get(low);
+    if (prev && prev !== p) {
+      throw new Error(`Case-folding path collision rejected: ${prev} vs ${p}`);
+    }
+    lowerSeen.set(low, p);
+  }
+
+  for (const p of allPaths) {
+    const o = oursMap.get(p) ?? null;
+    const m = mergedMap.get(p) ?? null;
+    if (o && m && o.oid === m.oid && o.mode === m.mode) continue;
+
+    assertSafeRelativePath(p);
+    assertNoSymlinkEscape(targetDir, p);
+
+    if (o && !ALLOWED_FILE_MODES.has(o.mode)) {
+      throw new Error(`Unsupported file mode (0${o.mode.toString(8)}) for automatic apply: ${p}`);
+    }
+    if (m && !ALLOWED_FILE_MODES.has(m.mode)) {
+      throw new Error(`Unsupported file mode (0${m.mode.toString(8)}) for automatic apply: ${p}`);
+    }
+    if (isSensitivePath(p)) {
+      sensitiveOmitted.push(p);
+    }
+
+    const status = !o && m ? "A" : o && !m ? "D" : "M";
+    files.push({ status, path: p });
+    entries.push({
+      path: p,
+      old: o ? { blob: o.oid, mode: o.mode } : null,
+      next: m ? { blob: m.oid, mode: m.mode } : null,
+    });
+  }
+
+  // Also check content aliases against targetDir's ignored sensitive files!
+  if (entries.length > 0 && isGitRepo(targetDir)) {
+    const fsTarget = snapshotFsSentinel(targetDir).snapshot;
+    const exactHashes = new Map<string, string>();
+    for (const [sp, fp] of Object.entries(fsTarget)) {
+      if (fp.exists && fp.sha256 && !fp.hashTruncated && fp.size !== undefined) {
+        exactHashes.set(`${fp.size}:${fp.sha256}`, sp);
+      }
+    }
+    if (exactHashes.size > 0) {
+      for (const entry of entries) {
+        if (!entry.next || isSensitivePath(entry.path)) continue;
+        const raw = gitBareBuffer(evidenceGitDir, ["cat-file", "blob", entry.next.blob]);
+        const h = createHash("sha256").update(raw).digest("hex");
+        const src = exactHashes.get(`${raw.length}:${h}`);
+        if (src) sensitiveOmitted.push(`${src} -> ${entry.path} (matches_sensitive_content)`);
+      }
+    }
+  }
+
+  return { entries, files, sensitiveOmitted };
+}
+
+function materializeOneEntry(evidenceGitDir: string, targetDir: string, entry: ApplyIntentEntry): void {
+  const abs = path.join(targetDir, entry.path);
+  assertSafeRelativePath(entry.path);
+  assertNoSymlinkEscape(targetDir, entry.path);
+
+  if (entry.next === null) {
+    try { unlinkSync(abs); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+    // Prune empty parent directories up to targetDir
+    let dir = path.dirname(abs);
+    while (dir.startsWith(targetDir) && dir !== targetDir) {
+      try {
+        if (readdirSync(dir).length === 0) rmSync(dir, { recursive: false });
+        else break;
+      } catch { break; }
+      dir = path.dirname(dir);
+    }
+    return;
+  }
+
+  const content = gitBareBuffer(evidenceGitDir, ["cat-file", "blob", entry.next.blob]);
+  const parentDir = path.dirname(abs);
+  mkdirSync(parentDir, { recursive: true });
+  const tmp = `${abs}.cb-apply.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  const fileMode = entry.next.mode === 0o100755 ? 0o755 : 0o644;
+  const fd = openSync(tmp, "wx", fileMode);
+  try {
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+  } catch (e) {
+    try { closeSync(fd); } catch {}
+    try { unlinkSync(tmp); } catch {}
+    throw e;
+  }
+  closeSync(fd);
+  try { chmodSync(tmp, fileMode); } catch {}
+  renameSync(tmp, abs);
+  fsyncDirBestEffort(parentDir);
+}
+
+/**
+ * Execute or recover a persisted `ApplyIntent`.
+ * - Single-file atomic replacement (temp file → fsync → rename).
+ * - Multi-file crash-recoverable: on recovery, entries matching `next` are skipped,
+ *   entries matching `old` are completed, and any unexpected 3rd-party modification stops
+ *   immediately with `CONFLICT_DURING_RECOVERY` without overwriting external edits.
+ */
+export function executeOrRecoverApplyIntent(
+  intent: ApplyIntent,
+  opts?: { faultAfterIndex?: number },
+): { ok: true; intent: ApplyIntent } | { ok: false; intent: ApplyIntent; conflictPath?: string; error: string } {
+  if (intent.status === "COMMITTED") return { ok: true, intent };
+
+  for (let i = 0; i < intent.entries.length; i++) {
+    const entry = intent.entries[i];
+    const abs = path.join(intent.targetDir, entry.path);
+    const current = gitBlobOidOfFile(abs);
+
+    if (refsMatch(current, entry.next)) continue;
+
+    if (!refsMatch(current, entry.old)) {
+      const failed: ApplyIntent = {
+        ...intent,
+        status: "CONFLICT_DURING_RECOVERY",
+        conflictPath: entry.path,
+        error: `External modification detected on ${entry.path} during apply/recovery; refusing to overwrite.`,
+        updatedAt: new Date().toISOString(),
+      };
+      writeApplyIntent(failed);
+      return { ok: false, intent: failed, conflictPath: entry.path, error: failed.error! };
+    }
+
+    materializeOneEntry(intent.evidenceGitDir, intent.targetDir, entry);
+
+    // Deterministic chaos fault hook for testing mid-apply crash recovery
+    if (opts?.faultAfterIndex !== undefined && i === opts.faultAfterIndex) {
+      throw new Error(`Injected apply crash after entry ${i} (${entry.path})`);
+    }
+  }
+
+  // Final verification pass: confirm every entry matches `next`
+  for (const entry of intent.entries) {
+    const abs = path.join(intent.targetDir, entry.path);
+    const current = gitBlobOidOfFile(abs);
+    if (!refsMatch(current, entry.next)) {
+      const failed: ApplyIntent = {
+        ...intent,
+        status: "CONFLICT_DURING_RECOVERY",
+        conflictPath: entry.path,
+        error: `Post-write verification mismatch on ${entry.path}.`,
+        updatedAt: new Date().toISOString(),
+      };
+      writeApplyIntent(failed);
+      return { ok: false, intent: failed, conflictPath: entry.path, error: failed.error! };
+    }
+  }
+
+  const committed: ApplyIntent = {
+    ...intent,
+    status: "COMMITTED",
+    updatedAt: new Date().toISOString(),
+  };
+  writeApplyIntent(committed);
+  return { ok: true, intent: committed };
+}
+
+export function prepareApplyIntent(params: {
+  runId: string;
+  workspaceId: string;
+  targetDir: string;
+  evidenceGitDir: string;
+  baseTree: string;
+  oursTree: string;
+  resultTree: string;
+  mergedTree: string;
+  entries: ApplyIntentEntry[];
+}): ApplyIntent {
+  const now = new Date().toISOString();
+  const intent: ApplyIntent = {
+    operationId: randomUUID(),
+    runId: params.runId,
+    workspaceId: params.workspaceId,
+    targetDir: params.targetDir,
+    targetHash: resourceKey(params.targetDir),
+    evidenceGitDir: params.evidenceGitDir,
+    status: "PREPARED",
+    baseTree: params.baseTree,
+    oursTree: params.oursTree,
+    resultTree: params.resultTree,
+    mergedTree: params.mergedTree,
+    entries: params.entries,
+    createdAt: now,
+    updatedAt: now,
+  };
+  // Pin merged tree before persisting intent so objects remain durable across crashes
+  pinTreeInEvidence(params.evidenceGitDir, params.mergedTree, `refs/codex-bridge/applies/${intent.operationId}`);
+  writeApplyIntent(intent);
+  return intent;
+}
+
 export function exportWorktreePatch(worktreePath: string, outPath: string): { changed: boolean; files: DiffFile[]; sensitiveOmitted: string[] } {
   const after = snapshotWorktreeTree(worktreePath);
   try {
     let headTree: string;
     try { headTree = git(worktreePath, ["rev-parse", "HEAD^{tree}"]).trim(); }
-    catch { headTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"; }
+    catch { headTree = EMPTY_TREE_OID; }
     if (headTree === after.tree) return { changed: false, files: [], sensitiveOmitted: [] };
     const env = { GIT_ALTERNATE_OBJECT_DIRECTORIES: [getRepoObjectDir(worktreePath), after.objectDir].join(path.delimiter) };
     const files = parseNameStatusZ(git(worktreePath, ["diff", "--no-ext-diff", "--name-status", "-z", ...DIFF_DETECT_ARGS, headTree, after.tree, "--"], env));
@@ -459,8 +1179,6 @@ export function killPidTree(pid: number, sig: NodeJS.Signals = "SIGTERM") {
   try { process.kill(-pid, sig); } catch { try { process.kill(pid, sig); } catch {} }
 }
 
-// ps -o command= truncates long argv, so a runId near the tail can be invisible.
-// Walking the ppid chain is a truncation-proof liveness check.
 export function pidParent(pid: number): number | undefined {
   try {
     const s = execFileSync("ps", ["-p", String(pid), "-o", "ppid="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 4096 }).trim();
@@ -534,7 +1252,6 @@ export function checkJsonlHealth(ev: EventSummary, sessionId: string): string | 
   if (unknownRatio > 0.5 && total >= 5) return `Codex JSONL schema may have changed: ${Math.round(unknownRatio * 100)}% of ${total} events are unrecognized types.`;
   return undefined;
 }
-
 
 // ── Helpers ──────────────────────────────────────────────────────
 export function readCapped(p: string, max: number): { text: string; truncated: boolean } | undefined {

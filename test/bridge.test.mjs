@@ -4,12 +4,13 @@ import assert from "node:assert/strict";
 import { existsSync, rmSync, unlinkSync, mkdtempSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnBridge, makeRepo, git, waitFor, setStubControl } from "./helpers.mjs";
+import { spawnBridge, makeRepo, git, waitFor, setStubControl as _setStubControl } from "./helpers.mjs";
 
 let bridge;
 let bridgeHome;
 let initResult;
 let repo;
+const setStubControl = (ctl) => _setStubControl(ctl, bridgeHome);
 
 before(async () => {
 	repo = makeRepo();
@@ -47,7 +48,8 @@ test("doctor reports healthy with stub codex", async () => {
 	assert.equal(r.bridge_home_writable, true);
 	assert.equal(typeof r.active_worktrees, "number");
 	assert.equal(r.max_wait_seconds, 240);
-	assert.equal(r.default_idle_timeout_seconds, 900);
+	assert.equal(r.default_idle_timeout_seconds, null);
+	assert.equal(r.default_idle_attention_seconds, 900);
 	assert.equal(r.default_wall_timeout_seconds, null);
 });
 

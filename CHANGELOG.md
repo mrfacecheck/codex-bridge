@@ -1,5 +1,37 @@
 # Changelog
 
+## v3.0.0
+
+Architectural kernel rewrite grounded in first-principles systems invariants (ownership, durability, evidence sealing, and honest uncertainty).
+
+### Breaking-free Architectural Shifts
+- **Independent Snapshot Repository + Out-of-Band `evidence.git`** (replaces shared-metadata linked worktrees for `isolation="worktree"`):
+  - Isolates `.git` completely from the parent repo (no shared refs, hooks, remotes, alternates, or `.git/config`).
+  - Seals immutable `origin_tree`, `before_tree`, and `after_tree` directly into a protected bare `evidence.git` (`core.fsyncMethod=fsync`, `hash-object --no-filters`).
+  - Completely immune to Codex running `git commit`, `git reset`, `git checkout`, or modifying `.gitignore` to hide existing origin source files.
+  - Supports explicit `base: "working_tree"` (in addition to git refs like `"HEAD"`) to freeze uncommitted parent edits into immutable `origin_tree` when delegating mid-edit work.
+- **Private-Store 3-Way Merge (`git merge-tree --write-tree`) + Recoverable File Materialization**:
+  - Replaces fragile `git apply` with Git 2.38+-compatible 3-way tree merges computed entirely inside `evidence.git` — preserves parent `.git/index` (staged changes) and merges disjoint parent edits without ever polluting the working tree on conflict.
+  - Persists a durable `PREPARED → COMMITTED` `ApplyIntent` (`applies/<opId>.json`) with per-file atomic replacement (`tmp → fsync → rename`) and crash recovery that skips already-landed files, finishes remaining files, and halts cleanly (`CONFLICT_DURING_RECOVERY`) if a 3rd-party external edit touched an incomplete target.
+  - Rejects unsafe paths (`..`, `.git`, case-folding collisions, symlinks, gitlinks, directory/file swaps, sensitive paths/aliases) before touching a single parent file.
+  - Tracks per-target session `appliedWatermarks` so multi-turn resumed applies merge only the incremental delta since the last applied turn.
+- **Attention-Only Default + Sleep-Immune Effective Observation Clock**:
+  - Cancels default silent idle auto-kill (`default_idle_timeout_seconds: null`); replaces it with a 1-shot cursor-acked **`attention`** signal (`default_idle_attention_seconds: 900`, plus `repeated_failure` after 3 identical non-zero exits and 30s `no_response`). Unattended cost-capped runs pass explicit `idle_timeout` or `timeout`.
+  - 2-second monotonic/wall delta sampler detects host sleep, lid-close suspend, or clock skew as `observer_gap`, excluding anomalous intervals from `observed_active_ms` / `idle_active_ms` and requiring 2 normal ticks before budget verdicts resume.
+  - Honest usage reporting: `reported_usage` stays `null` until Codex actually emits usage (never fake zeros mid-run).
+- **Direct-FD Logs + Early `thread.started` Durability + At-Most-Once Admission + `unknown` Liveness**:
+  - Codex stdout/stderr write directly to private file descriptors (`codex.stdout.jsonl` / `codex.stderr.log`), preventing EPIPE on worker death and enabling automatic post-crash log & disk-tree salvage (`salvaged: true`, honest `exit_code: null`).
+  - First `thread.started` immediately fsyncs `session.json` and updates the session index.
+  - `idempotency_key` on `codex_exec` / `codex_resume` / `apply` enforces at-most-once admission via atomic exclusive file creation + post-GC `tombstones/`.
+  - Owner-nonce leases (`locks/`) with host `bootId` are NEVER stolen by heartbeat timeout; if a worker dies while its Codex child may still be writing, reconciliation reports `liveness: "unknown"` and blocks `resume` / `apply` / `cleanup` until writer exit is proven.
+- **Zero-Spawn Hot Path + Native Multi-Worker `wait-any` (`codex_sessions.get(run_ids[])`)**:
+  - Eliminates synchronous `ps` forks on normal `get` / `list` hot paths via fresh heartbeat checks + shared directory-watch multiplexer (`read → watch → re-read` anti-lost-wakeup protocol).
+  - `action="get"` accepts `run_ids: string[]` + `cursor: Record<string, number>` for single-call wait-any across parallel workers with per-item error isolation.
+- **Defense-in-Depth Security & Model-Free `prepare`**:
+  - `grants.ts` rejects project-level `.codex/config.toml` ungranted MCP server injection fail-closed and runs `codex mcp list --json` inside `runCwd`, plus cached binary-identity capability probing.
+  - Optional `prepare: { command, args, timeout_seconds }` runs inside the workspace before invoking Codex (zero model tokens spent on setup failures).
+  - Session-rooted GC preserves active/unknown runs, resumable session workspaces & shadow `CODEX_HOME`, pending `PREPARED` applies, and recycles expired keys into tombstones.
+
 ## v2.4.0
 
 First-principles reliability and ergonomics overhaul driven by telemetry from multi-file `gpt-6.2-sol` (`xhigh`) production runs.

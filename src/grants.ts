@@ -15,10 +15,10 @@
  * rejected.
  */
 import { spawnSync } from "child_process";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
-import { CODEX_BINARY, buildCodexEnv } from "./evidence.js";
+import { CODEX_BINARY, CODEX_BINARY_REALPATH, buildCodexEnv } from "./evidence.js";
 
 export interface McpServerInfo { name: string; enabled: boolean; env: Record<string, unknown>; envVars: string[]; hasHttpSecrets: boolean }
 export interface Grants { mcp: string[] }
@@ -59,9 +59,15 @@ export function gateGrantsStatic(grants: Grants): void {
   if (bad.length) throw new GrantRejection(bad);
 }
 
-export function listMcpServers(codexHome?: string): McpServerInfo[] {
+export function listMcpServers(codexHome?: string, cwd?: string): McpServerInfo[] {
   const env = codexHome ? { ...buildCodexEnv(), CODEX_HOME: codexHome } : buildCodexEnv();
-  const r = spawnSync(CODEX_BINARY, ["mcp", "list", "--json"], { encoding: "utf8", env, timeout: 30_000 });
+  const useCwd = cwd && existsSync(cwd) ? cwd : undefined;
+  const r = spawnSync(CODEX_BINARY, ["mcp", "list", "--json"], {
+    encoding: "utf8",
+    env,
+    timeout: 30_000,
+    ...(useCwd ? { cwd: useCwd } : {}),
+  });
   if (r.status !== 0) throw new Error(`codex mcp list failed (exit ${r.status})`);
   const t = r.stdout ?? "";
   const i = t.indexOf("[");
@@ -75,6 +81,39 @@ export function listMcpServers(codexHome?: string): McpServerInfo[] {
       hasHttpSecrets: Boolean(tr.bearer_token_env_var || (tr.http_headers && Object.keys(tr.http_headers).length) || (tr.env_http_headers && Object.keys(tr.env_http_headers).length)),
     };
   });
+}
+
+export interface CliCapabilityProbe {
+  binary: string;
+  binaryIdentity: string;
+  version: string | null;
+  mcpListSupported: boolean;
+}
+
+const capabilityProbeCache = new Map<string, CliCapabilityProbe>();
+
+export function probeCodexCapabilities(): CliCapabilityProbe {
+  const target = CODEX_BINARY_REALPATH || CODEX_BINARY;
+  let identity = target;
+  try {
+    const st = statSync(target);
+    identity = `${target}:${st.size}:${Math.floor(st.mtimeMs)}`;
+  } catch {}
+  const cached = capabilityProbeCache.get(identity);
+  if (cached) return cached;
+
+  const env = buildCodexEnv();
+  const ver = spawnSync(CODEX_BINARY, ["--version"], { encoding: "utf8", env, timeout: 10_000 });
+  const version = ver.status === 0 ? ((ver.stdout || ver.stderr || "").trim() || null) : null;
+  let mcpListSupported = false;
+  try {
+    listMcpServers();
+    mcpListSupported = true;
+  } catch {}
+
+  const probe: CliCapabilityProbe = { binary: CODEX_BINARY, binaryIdentity: identity, version, mcpListSupported };
+  capabilityProbeCache.set(identity, probe);
+  return probe;
 }
 
 export function gateGrantsAgainstServers(grants: Grants, servers: McpServerInfo[]): void {
@@ -258,8 +297,24 @@ export function resolveMcpHome(grants: Grants, runCwd: string, runDir: string): 
   for (const n of grants.mcp) sections.push(blocks.get(n)!);
   writeFileSync(path.join(codexHome, "config.toml"), sections.join("\n\n") + "\n", { mode: 0o600 });
 
-  const probe = listMcpServers(codexHome).map((s) => ({ name: s.name, enabled: s.enabled }));
   const granted = new Set(grants.mcp);
+  // Defense-in-depth: fail closed if the target repo carries a project-level .codex/config.toml
+  // declaring ungranted MCP servers (could otherwise be loaded by Codex CLI when cwd is trusted).
+  const projectCodexConfig = path.join(runCwd, ".codex", "config.toml");
+  if (existsSync(projectCodexConfig)) {
+    try {
+      const projToml = readFileSync(projectCodexConfig, "utf8");
+      const projServers = extractServerBlocks(projToml);
+      const ungrantedProj = [...projServers.keys()].filter((n) => !granted.has(n));
+      if (ungrantedProj.length > 0) {
+        throw new GrantRejection(ungrantedProj.map((n) => ({ server: n, reason: "project .codex/config.toml injects ungranted MCP server" })));
+      }
+    } catch (e) {
+      if (e instanceof GrantRejection) throw e;
+    }
+  }
+
+  const probe = listMcpServers(codexHome, runCwd).map((s) => ({ name: s.name, enabled: s.enabled }));
   const leaked = probe.filter((p) => !granted.has(p.name)).map((p) => p.name);
   const dropped = grants.mcp.filter((n) => !probe.some((p) => p.name === n && p.enabled));
   if (leaked.length || dropped.length) {

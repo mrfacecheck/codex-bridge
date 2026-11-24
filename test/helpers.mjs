@@ -76,9 +76,10 @@ export function makeRepo() {
 export const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8" });
 
 const CONTROL_PATH = join(tmpdir(), "cb-stub-codex-control.json");
-/** Write stub-codex control file; empty object resets to defaults. */
-export function setStubControl(ctl) {
-	writeFileSync(CONTROL_PATH, JSON.stringify(ctl));
+/** Write stub-codex control file; pass bridgeHome to isolate parallel test suites. */
+export function setStubControl(ctl, bridgeHome) {
+	const target = bridgeHome ? join(bridgeHome, "stub-codex-control.json") : CONTROL_PATH;
+	writeFileSync(target, JSON.stringify(ctl));
 }
 
 export async function waitFor(fn, timeoutMs = 30_000, step = 100) {

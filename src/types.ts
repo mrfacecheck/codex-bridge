@@ -7,6 +7,7 @@ export const TRUNCATED_HEAD_MARKER = "\n...[truncated; showing head]...\n";
 export const DIFF_DETECT_ARGS = ["--find-renames", "--find-copies", "--find-copies-harder"];
 export const DIFF_RENDER_ARGS = ["--find-renames"];
 export const SENSITIVE_HASH_MAX = 256 * 1024 * 1024;
+export const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 export const SAFE_ENV = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP",
@@ -43,17 +44,54 @@ export const ACTIVE_SESSION_SCAN_LIMIT = 100;
 export const PRIMARY_PREVIEW_FILE_LIMIT = 20;
 export const SECONDARY_PREVIEW_FILE_LIMIT = 5;
 export const LOW_VALUE_HEADER_LIMIT = 10;
-export const DEFAULT_IDLE_TIMEOUT = 900; // 15 min without real Codex JSONL activity
+// v3: default idle watchdog raises a 1-shot attention signal instead of silently auto-killing.
+// Callers who want unattended cost/time enforcement pass explicit idle_timeout or timeout.
+export const DEFAULT_IDLE_ATTENTION = 900;
+export const DEFAULT_IDLE_TIMEOUT: number | null = null;
+export const HEARTBEAT_STALE_MS = 15_000;
 
-// ── Status Model ─────────────────────────────────────────────────
+// ── v3 Lifecycle / Liveness / Attention Model ────────────────────
+export type Phase = "accepted" | "preparing" | "running" | "sealing" | "terminal";
+export type Outcome = "succeeded" | "failed" | "cancelled" | "interrupted";
+export type Liveness = "alive" | "gone" | "unknown";
+export type AttentionCode = "idle_silence" | "repeated_failure" | "no_response" | "observer_gap";
+
+export interface AttentionState {
+  code: AttentionCode;
+  revision: number;
+  message: string;
+  raisedAt: string;
+}
+
+export interface CommandStats {
+  completed: number;
+  failed: number;
+  inflight: number;
+}
+
+export interface PrepareSpec {
+  command: string;
+  args?: string[];
+  timeout_seconds?: number;
+}
+
 export const TERMINAL_STATUSES = ["completed", "failed", "timeout", "cancelled"] as const;
 export type TerminalStatus = typeof TERMINAL_STATUSES[number];
 
-export type ActivePhase = "starting" | "snapshot-before" | "running" | "cancelling" | "snapshot-after" | "building-review";
+export type ActivePhase = "starting" | "preparing" | "snapshot-before" | "running" | "cancelling" | "snapshot-after" | "building-review" | "sealing";
 export type ProgressPhase = ActivePhase | TerminalStatus;
 
 export function isTerminal(status?: string): status is TerminalStatus {
   return Boolean(status && (TERMINAL_STATUSES as readonly string[]).includes(status));
+}
+
+export function statusToPhase(status?: string): Phase {
+  if (!status) return "accepted";
+  if (isTerminal(status)) return "terminal";
+  if (status === "preparing" || status === "snapshot-before") return "preparing";
+  if (status === "snapshot-after" || status === "building-review" || status === "sealing") return "sealing";
+  if (status === "starting") return "accepted";
+  return "running";
 }
 
 // ── Git / Evidence Types ─────────────────────────────────────────
@@ -78,9 +116,101 @@ export interface GitDiffResult {
 }
 export interface NoGitResult { is_git_repo: false; changed: boolean; summary: string }
 
-// ── Lock ─────────────────────────────────────────────────────────
-export interface LockPayload { bridgePid: number; childPid?: number; runId: string; cwd: string; createdAt: string }
+// ── Lock & v3 Lease ──────────────────────────────────────────────
+export interface LockPayload { bridgePid: number; childPid?: number; runId: string; cwd: string; createdAt: string; ownerNonce?: string; bootId?: string }
 export interface WriteLock { lockPath: string; runId: string; release: () => void; attachChildPid: (pid: number) => void }
+
+export interface StartedRecord {
+  runId: string;
+  ownerNonce: string;
+  bootId: string;
+  workerPid: number;
+  codexPid?: number;
+  codexVersion?: string;
+  startedAt: string;
+}
+
+export interface LeaseRecord {
+  resourceKey: string;
+  resourcePath: string;
+  runId: string;
+  ownerNonce: string;
+  bootId: string;
+  workerPid: number;
+  codexPid?: number;
+  createdAt: string;
+}
+
+export interface SessionRecord {
+  sessionId: string;
+  latestRunId: string;
+  runIds: string[];
+  workspaceId?: string;
+  mcpHome?: string;
+  cwd?: string;
+  parentGitRoot?: string | null;
+  sandbox?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceMeta {
+  workspaceId: string;
+  kind: "snapshot" | "worktree" | "inplace";
+  parentGitRoot: string | null;
+  srcDir: string;
+  evidenceGitDir: string | null;
+  baseSpec: string;
+  originCommit: string | null;
+  originTree: string | null;
+  parentDirtyAtCreate?: boolean;
+  appliedWatermarks: Record<string, string>;
+  createdAt: string;
+  cleanedAt?: string;
+}
+
+export interface FileObjectRef { blob: string; mode: number }
+export interface ApplyIntentEntry {
+  path: string;
+  old: FileObjectRef | null;
+  next: FileObjectRef | null;
+}
+
+export interface ApplyIntent {
+  operationId: string;
+  runId: string;
+  workspaceId: string;
+  targetDir: string;
+  targetHash: string;
+  evidenceGitDir: string;
+  status: "PREPARED" | "COMMITTED" | "ABORTED" | "CONFLICT_DURING_RECOVERY";
+  baseTree: string;
+  oursTree: string;
+  resultTree: string;
+  mergedTree: string;
+  entries: ApplyIntentEntry[];
+  createdAt: string;
+  updatedAt: string;
+  conflictPath?: string;
+  error?: string;
+}
+
+export interface IdempotencyRecord {
+  namespace: "exec" | "resume" | "apply";
+  key: string;
+  requestDigest: string;
+  runId?: string;
+  operationId?: string;
+  createdAt: string;
+}
+
+export interface TombstoneRecord {
+  namespace: "exec" | "resume" | "apply";
+  key: string;
+  requestDigest: string;
+  runId?: string;
+  recycledAt: string;
+}
 
 // ── Codex Runner ─────────────────────────────────────────────────
 export type RunStatus = TerminalStatus;
@@ -94,7 +224,7 @@ export interface CodexResult {
 }
 export interface RunningCodex { runId: string; process: ChildProcess; promise: Promise<CodexResult>; cancel: () => void }
 
-// ── Session (in-memory, v1 compat) ──────────────────────────────
+// ── Session (in-memory, v1/v2 compat) ────────────────────────────
 export interface Session {
   latestRunId: string; runIds: string[]; sessionId?: string; name: string;
   status: "running" | TerminalStatus;
@@ -104,12 +234,14 @@ export interface Session {
   process?: ChildProcess; cancel?: () => void;
 }
 
-// ── v2: Execution Mode ───────────────────────────────────────────
+// ── Execution Mode ───────────────────────────────────────────────
 export type ExecutionMode = "auto" | "sync" | "async";
 
-// ── v2: Durable Run State ────────────────────────────────────────
+// ── Durable Run State ────────────────────────────────────────────
 export interface RunMeta {
   runId: string;
+  ownerNonce?: string;
+  idempotencyKey?: string;
   cwd: string;
   gitRoot: string | null;
   sandbox: string;
@@ -117,6 +249,7 @@ export interface RunMeta {
   model?: string;
   timeout?: number | null;
   idleTimeout?: number | null;
+  idleAttentionSeconds?: number | null;
   sessionName: string;
   maxDiffChars: number;
   allowNonGit: boolean;
@@ -129,8 +262,16 @@ export interface RunMeta {
   resumeContextVerified?: boolean;
   projectBrief?: boolean;
   isolation?: "inplace" | "worktree";
+  workspaceId?: string;
+  workspaceKind?: "snapshot" | "worktree" | "inplace";
   worktreePath?: string;
   parentGitRoot?: string | null;
+  evidenceGitDir?: string | null;
+  originTree?: string | null;
+  beforeTree?: string | null;
+  baseSpec?: string;
+  parentDirtyAtCreate?: boolean;
+  prepare?: PrepareSpec;
   effort?: string;
   outputSchema?: string;
   resolvedModel?: string | null;
@@ -144,42 +285,66 @@ export interface RunMeta {
 
 export interface ProgressState {
   status: ProgressPhase;
+  phase?: Phase;
+  liveness?: Liveness;
   message: string;
   updatedAt: string;
   seq: number;
+  revision?: number;
+  heartbeatSeq?: number;
+  heartbeatAt?: string;
   sessionId?: string;
   elapsedMs?: number;
+  observedActiveMs?: number;
+  idleActiveMs?: number;
+  observerGaps?: number;
+  commands?: CommandStats;
+  reportedUsage?: TokenUsage | null;
+  attention?: AttentionState | null;
+  evidenceSealed?: boolean;
   error?: string;
   lastActivityAt?: string;
 }
 
-export type RunHandleStatus = "running" | "failed" | "timeout" | "cancelled";
+export type RunHandleStatus = "running" | "failed" | "timeout" | "cancelled" | "unknown";
 
 export interface RunHandle {
   run_id: string;
   async: true;
   status: RunHandleStatus;
+  phase?: Phase;
+  liveness?: Liveness;
   session_id?: string;
+  workspace_id?: string;
   cwd: string;
   git_root?: string;
   worktree_path?: string;
+  parent_dirty_at_create?: boolean;
   progress: ProgressState;
   poll_with: string;
 }
 
-// ── v2: Review Packet (typed subset for in-process use) ──────────
+// ── Review Packet ────────────────────────────────────────────────
 export interface ReviewPacketLike {
   run_id?: string;
   async?: boolean;
   session_id?: string;
   session_name?: string;
   status?: RunStatus | string;
+  phase?: Phase;
+  outcome?: Outcome;
+  liveness?: Liveness;
+  salvaged?: boolean;
   status_detail?: string;
   failure_hint?: string;
   partial_changes?: boolean;
   cwd?: string;
   git_root?: string;
+  workspace_id?: string;
+  workspace_kind?: "snapshot" | "worktree" | "inplace";
   duration_ms?: number;
+  observed_active_ms?: number;
+  observer_gaps?: number;
   output?: string;
   output_source?: string;
   output_truncated?: boolean;
@@ -187,7 +352,22 @@ export interface ReviewPacketLike {
   stderr_truncated?: boolean;
   process?: { exit_code: number | null; signal: string | null };
   token_usage?: TokenUsage;
+  reported_usage?: TokenUsage | null;
   events?: EventSummary;
+  commands?: CommandStats;
+  attention?: AttentionState | null;
+  evidence?: {
+    sealed: boolean;
+    origin_tree?: string;
+    before_tree?: string;
+    after_tree?: string;
+    error?: string;
+  };
+  origin_tree?: string;
+  before_tree?: string;
+  after_tree?: string;
+  parent_dirty_at_create?: boolean;
+  prepare?: { ok: boolean; duration_ms: number; exit_code: number | null; log_path?: string; error?: string };
   git_diff?: {
     is_git_repo?: boolean;
     changed?: boolean;
@@ -209,6 +389,7 @@ export interface ReviewPacketLike {
   parent_git_root?: string;
   timeout?: number | null;
   idle_timeout?: number | null;
+  idle_attention_seconds?: number | null;
   worktree_escape?: { paths: string[]; evidence: string[] };
   concurrent_parent_changes?: { count: number; paths: string[] };
   resume_attached?: boolean;

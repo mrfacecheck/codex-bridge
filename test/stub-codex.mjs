@@ -12,15 +12,30 @@
  *     "delay_ms": 20 }
  * Env STUB_CODEX_MODE still honored as fallback when no control file exists.
  */
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, symlinkSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 export const CONTROL_PATH = join(tmpdir(), "cb-stub-codex-control.json");
 
+function resolveControlPath() {
+	// Walk up from CODEX_HOME to find per-test-suite isolated stub-codex-control.json
+	let dir = process.env.CODEX_HOME;
+	for (let i = 0; i < 5 && dir; i++) {
+		const cand = join(dir, "stub-codex-control.json");
+		if (existsSync(cand)) return cand;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return CONTROL_PATH;
+}
+
 const args = process.argv.slice(2);
-const ctl = existsSync(CONTROL_PATH) ? JSON.parse(readFileSync(CONTROL_PATH, "utf8")) : {};
+const resolvedControl = resolveControlPath();
+const ctl = existsSync(resolvedControl) ? JSON.parse(readFileSync(resolvedControl, "utf8")) : {};
 const MODE = ctl.mode ?? process.env.STUB_CODEX_MODE ?? "success";
 const DELAY = Number(ctl.delay_ms ?? 20);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,6 +123,31 @@ if (ctl.started_and_completed_cmd) {
 	ev({ type: "item.completed", item: { id: "fail-cmd", type: "command_execution", command: "lint --check", exit_code: 2, status: "completed" } });
 }
 
+if (ctl.repeated_fail_count > 0) {
+	for (let i = 1; i <= Number(ctl.repeated_fail_count); i++) {
+		ev({ type: "item.started", item: { id: `rf-${i}`, type: "command_execution", command: "pytest -q" } });
+		await sleep(30);
+		ev({ type: "item.completed", item: { id: `rf-${i}`, type: "command_execution", command: "pytest -q", exit_code: 2, status: "completed" } });
+	}
+}
+
+if (ctl.write_files && typeof ctl.write_files === "object") {
+	for (const [rel, content] of Object.entries(ctl.write_files)) {
+		write(join(cwd, rel), String(content));
+		ev({ type: "item.completed", item: { id: `wf-${rel}`, type: "file_change", changes: [{ path: rel, kind: "update" }], status: "completed" } });
+	}
+}
+
+if (ctl.create_symlink && typeof ctl.create_symlink === "object") {
+	const { rel, target } = ctl.create_symlink;
+	mkdirSync(dirname(join(cwd, rel)), { recursive: true });
+	symlinkSync(target, join(cwd, rel));
+}
+
+if (ctl.gitignore_append) {
+	appendFileSync(join(cwd, ".gitignore"), String(ctl.gitignore_append) + "\n");
+}
+
 if (MODE === "escape") {
 	const target = ctl.escape_path;
 	if (target) {
@@ -121,6 +161,16 @@ if (MODE === "escape") {
 	ev({ type: "item.completed", item: { id: "i1", type: "command_execution", command: `write ${rel}`, aggregated_output: "", status: "completed" } });
 	await sleep(DELAY);
 	ev({ type: "item.completed", item: { id: "i2", type: "file_change", changes: [{ path: rel, kind: "add" }], status: "completed" } });
+}
+
+if (ctl.git_commit) {
+	execFileSync("git", ["add", "-A"], { cwd });
+	execFileSync("git", ["-c", "user.email=agent@local", "-c", "user.name=agent", "commit", "-qm", "agent self-commit"], { cwd });
+}
+
+if (ctl.hang_after_write) {
+	setInterval(() => {}, 60_000);
+	await new Promise(() => {});
 }
 
 await sleep(DELAY);
